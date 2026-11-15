@@ -42,7 +42,8 @@
  *
  *   const s = new Strobe({ diag, log, allowed, channels, hold });  await s.find();   s.kind -> 'flm' | 'fle' | 'bdc' | 'g05' | null
  *   s.start({ lights: 'all' | 'high', pattern: 'both' | 'alternate', rate: 'fast' | 'normal' | 'slow' })   s.show()   s.learn()   s.stop()
- *   s.running -> 'strobe' | 'show' | 'learn' | null       s.note       s.on('change', fn)   s.on('learned', fn(channels))
+ *   s.runPack(pack, { loop })   s.packWhy(pack)   s.clearFaults()      (packs.js: timed light steps, see runPack)
+ *   s.running -> 'strobe' | 'show' | 'learn' | 'pack' | 'clear' | null   s.pack   s.note   s.on('change', fn)   s.on('learned', fn(channels))
  */
 const EventEmitter = require('events');
 
@@ -103,6 +104,9 @@ const BUDGET_WINDOW_MS = 600000;
 const HOT_FN_EVERY_MS = 10000;   // the headlights' temperatures while the body controller flashes (police)
 const HOT_C = 90;
 const HOT_EVERY_MS = 5000;
+// packs (runPack): at most this long a press, looped or not; the session entered again after this long without a request
+const PACK_MAX_MS = 60000;
+const PACK_SESSION_MS = 4000;
 const statusIndex = (kind, el) => KINDS[kind].first + el - 1;   // the output's byte after 62 <did>
 
 const hex = (b) => (b || []).map((x) => (x < 16 ? '0' : '') + x.toString(16).toUpperCase()).join(' ');
@@ -699,23 +703,158 @@ class Strobe extends EventEmitter {
         return found;
     }
 
+    // --- packs (packs.js): timed light steps on the body controller ---
+
+    /** Why this way to the lamps cannot run the pack (its needs), or null. */
+    packWhy(pack) {
+        if (!pack || pack.errors) return pack && pack.errors ? 'the pack has errors: ' + pack.errors[0] : 'no pack';
+        if (!this.kind) return 'no headlight or lamp output control found';
+        for (const n of pack.needs || []) {
+            if (n === 'fn' && this.kind !== 'fn') return 'needs the body controller\'s light functions (this car: ' + this.kindName + ')';
+            if (n === 'outputs' && !KINDS[this.kind]) return 'needs the body controller\'s lamp outputs (this car: ' + this.kindName + ')';
+            if (n === 'disco' && !(this.kind === 'fn' || KINDS[this.kind])) return 'needs the body controller (this car: ' + this.kindName + ')';
+        }
+        return null;
+    }
+
+    /**
+     * A pack (packs.js validate()) step by step until its end, Stop, PACK_MAX_MS, a refusal or allowed('pack') saying
+     * no; o.loop (or the pack's own loop): round and round. Every request is the body controller's (one at a time):
+     * the extended session first (again if a step finds it gone: PACK_SESSION_MS without a request, or a refusal for
+     * the session), 3E 00 while a step waits; at the end every light function it used off, every lamp output it
+     * switched off and handed back, a show stopped early ended, and the default session (10 01).
+     * this.pack while it runs: { title, step, of, pass }.
+     */
+    runPack(pack, o) { return this._held(() => this._runPack(pack, o)); }
+    async _runPack(pack, o) {
+        if (this.running) return;
+        const why = this.packWhy(pack) || this._resting() || this.allowed('pack');
+        if (why) { this._say((pack && pack.title || 'Pack') + ' not started: ' + why, 'warn'); return; }
+        const loop = !!(o && o.loop) || pack.loop === true;
+        this.running = 'pack'; this._stop = false;
+        this.pack = { title: pack.title, step: 0, of: pack.steps.length, pass: 0 };
+        this._say(pack.title + ' starting...');
+        const t0 = this.now(), t = { keep: this.now() }, fns = new Set(), outs = new Set();
+        let sent = 0, end = null, disco = false, discoUntil = 0;
+        // t.keep: the last request the body controller took (a write or 3E 00)
+        const enter = async () => {
+            const r = await this._ask(BDC, 0x10, [0x03]);
+            if (!r || r[0] !== 0x50) return false;
+            t.keep = this.now();
+            return true;
+        };
+        // one write; a refusal for the session (7F xx 7F / 7E: the unit dropped it) enters it again and asks once more
+        const write = async (fn) => {
+            if (this.now() - t.keep > PACK_SESSION_MS && !(await enter())) return 'the body controller refused the diagnostic session';
+            let r = await fn();
+            if (r !== true && /NRC (7F|7E)/.test(r) && await enter()) r = await fn();
+            if (r === true) { sent++; t.keep = this.now(); }
+            return r;
+        };
+        try {
+            if (!(await enter())) { end = [pack.title + ': the body controller refused the diagnostic session', 'warn']; return; }
+            for (let pass = 0; !end; pass++) {
+                this.pack.pass = pass;
+                for (let i = 0; i < pack.steps.length && !end; i++) {
+                    if (this._stop) { end = [pack.title + ' stopped', 'dim']; break; }
+                    const stopWhy = this.allowed(this.running);
+                    if (stopWhy) { end = [pack.title + ' stopped: ' + stopWhy, 'warn']; break; }
+                    if (this.now() - t0 > PACK_MAX_MS) { end = [pack.title + ' done (' + PACK_MAX_MS / 1000 + ' s)', 'dim']; break; }
+                    const s = pack.steps[i], at = this.now();
+                    this.pack.step = i + 1;
+                    let r = true;
+                    if (s.job === 'fn') {
+                        const ticks = Math.max(3, Math.min(100, Math.round(s.ms / 10)));
+                        for (const name of s.fns) {
+                            r = await write(() => this._fn(name, ticks));
+                            if (r !== true) break;
+                            fns.add(name);
+                        }
+                    } else if (s.job === 'output') {
+                        for (const name of s.outputs) {
+                            const el = name === 'FL_R' ? FL_R : FL_L;
+                            r = await write(() => this._set(el, s.on));
+                            if (r !== true) break;
+                            outs.add(el);
+                        }
+                    } else if (s.job === 'disco') {
+                        r = await write(async () => {
+                            const q = await this._ask(BDC, 0x2E, DISCO.concat([100, 0, s.fast ? 0x03 : 0x04, 0, (s.ms >> 8) & 0xFF, s.ms & 0xFF, 0, 0]));
+                            return q && q[0] === 0x6E ? true : q ? 'NRC ' + hex([q[2]]) : 'no answer';
+                        });
+                        if (r === true) { disco = true; discoUntil = this.now() + s.ms; }
+                    }
+                    if (r !== true) { end = [pack.title + ' stopped: refused (' + r + ')', 'warn']; break; }
+                    if (sent === 1) this._say(pack.title + ' on');
+                    this.emit('change');
+                    // the step's delay, the session kept meanwhile; Stop ends the wait at once
+                    while (!this._stop && this.now() - at < s.delayMs) {
+                        await this._keep(t);
+                        await this.sleep(Math.min(200, Math.max(1, s.delayMs - (this.now() - at))));
+                    }
+                }
+                if (!loop) break;
+            }
+            if (!end) end = [this._stop ? pack.title + ' stopped' : pack.title + ' done', 'dim'];
+        } finally {
+            for (const name of fns) await this._fn(name, 0);
+            for (const el of outs) {
+                await this._set(el, false);
+                await this._ask(BDC, 0x2F, KINDS[this.kind].control.concat([RCTECU, el, 0x00]));
+            }
+            if (disco && this.now() < discoUntil) await this._ask(BDC, 0x2E, DISCO.concat([0, 0, 0x04, 0, 0, 0, 0, 0]));
+            await this._ask(BDC, 0x10, [0x01]);
+            this.running = null; this.pack = null;
+            if (sent > 0) this._rest(t0);
+            this.log.info('strobe: ' + (end ? end[0] : 'pack ended') + ' after ' + sent + ' requests');
+            this._say(end ? end[0] : pack.title + ' stopped', end ? end[1] : 'dim');
+        }
+    }
+
+    /**
+     * The light units' fault memories cleared (14 FF FF FF): the body controller and the headlight units that answer,
+     * what a light show may leave as lamp faults. Resolves with [{ ecu, ok, why }] (null while something runs).
+     */
+    clearFaults() { return this._held(() => this._clearFaults()); }
+    async _clearFaults() {
+        if (this.running) return null;
+        this.running = 'clear';
+        const out = [];
+        try {
+            for (const a of [BDC].concat(SIDES)) {
+                const r = await this._ask(a, 0x14, [0xFF, 0xFF, 0xFF], a === BDC ? 8000 : 3000);
+                if (!r && a !== BDC) continue;                // no such headlight unit
+                out.push({ ecu: a, ok: !!(r && r[0] === 0x54), why: !r ? 'no answer' : r[0] === 0x7F ? 'NRC ' + hex([r[2]]) : null });
+            }
+        } finally { this.running = null; }
+        const n = out.filter((x) => x.ok).length;
+        this.log.info('strobe: faults cleared in ' + out.map((x) => hex([x.ecu]) + (x.ok ? ' ok' : ' ' + x.why)).join(', '));
+        this._say('Light faults cleared in ' + n + ' of ' + out.length + ' units', n === out.length ? 'dim' : 'warn');
+        return out;
+    }
+
     stop() { this._stop = true; }
 }
 
 /*
- * Whether the strobe and the light show may run now: switched on in the settings and someone in the car; the light show
- * (every headlight LED against all dark) also only with the car standing still. The high beam strobe may run while driving.
- *   gateChecks({ setting, away, moving }) -> [[label, ok, why, only], ...]   (only: the check is for that one alone)
- *   gateWhy(checks, what) -> null (what - 'strobe', 'show', 'learn' - may run) | why not
+ * Whether the strobe, the light show and the packs may run now: switched on in the settings and someone in the car; the
+ * light show (every headlight LED against all dark) and the packs also only with the car standing still. The high beam
+ * strobe may run while driving.
+ *   gateChecks({ setting, away, moving }) -> [[label, ok, why, only], ...]   (only: the check is for those alone)
+ *   gateWhy(checks, what) -> null (what - 'strobe', 'show', 'learn', 'pack' - may run) | why not
  * moving: kit/parked.js's moving() - a speed over 3 km/h, and quiet after driving counts as moving until a speed is read again.
  */
 function gateChecks(o) {
     return [
         ['Switched on in the settings', o.setting === true],
         ['Someone in the car', !o.away],
-        ['The car standing still (light show)', !o.moving, null, 'show'],
+        ['The car standing still (light show, packs)', !o.moving, null, ['show', 'pack']],
     ];
 }
-const gateWhy = (checks, what) => { const c = checks.find((x) => !x[1] && (!x[3] || x[3] === what)); return c ? c[0].toLowerCase() + ': no' : null; };
+const gateWhy = (checks, what) => {
+    const c = checks.find((x) => !x[1] && (!x[3] || [].concat(x[3]).indexOf(what) >= 0));
+    return c ? c[0].toLowerCase() + ': no' : null;
+};
 
-module.exports = { gateChecks, gateWhy, Strobe, KINDS, HEAD, F, FN_PATTERNS, FLASH, POLICE_ORDERS, flashTicks, SIDES, FL_L, FL_R, HALF_MS, MAX_MS, SHOW_MS, statusIndex };
+module.exports = { gateChecks, gateWhy, Strobe, KINDS, HEAD, F, FN_PATTERNS, FLASH, POLICE_ORDERS, flashTicks, SIDES, FL_L, FL_R, HALF_MS, MAX_MS, SHOW_MS,
+    PACK_MAX_MS, PACK_SESSION_MS, statusIndex };

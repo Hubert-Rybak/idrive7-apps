@@ -458,7 +458,7 @@ const writes = (diag, a) => diag.sent.filter((x) => x.indexOf(hex([a]) + ' 31 01
     {
         const g = (o, what) => gateWhy(gateChecks(Object.assign({ setting: true, away: false, moving: false }, o)), what);
         ok(g({}, 'show') === null && g({}, 'strobe') === null, 'standing: both may run');
-        ok(g({ moving: true }, 'show') === 'the car standing still (light show): no', 'moving: no light show (' + g({ moving: true }, 'show') + ')');
+        ok(g({ moving: true }, 'show') === 'the car standing still (light show, packs): no', 'moving: no light show (' + g({ moving: true }, 'show') + ')');
         ok(g({ moving: true }, 'strobe') === null, 'moving: the strobe may run');
         ok(g({ moving: true }, 'learn') === null, 'moving: learning may run');
         ok(g({ setting: false }, 'strobe') === 'switched on in the settings: no', 'off in the settings');
@@ -483,7 +483,7 @@ const writes = (diag, a) => diag.sent.filter((x) => x.indexOf(hex([a]) + ' 31 01
     // the gate is asked which: the strobe's flashes ask for 'strobe', the light show's for 'show'
     {
         const asked = new Set();
-        const { s } = make('bdc', { allowed: (what) => { asked.add(what); return what === 'show' ? 'the car standing still (light show): no' : null; } });
+        const { s } = make('bdc', { allowed: (what) => { asked.add(what); return what === 'show' ? 'the car standing still (light show, packs): no' : null; } });
         await s.find();
         await s.show({});
         ok(asked.has('show') && /Light show not started: the car standing still/.test(s.note), 'the light show asks for show and is stopped (' + s.note + ')');
