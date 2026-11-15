@@ -20,6 +20,7 @@
  */
 const mgu = require('./kit/mgu');
 const G = require('./kit/gauges');
+const { fitText } = require('./kit/text-layout');
 const { withAlpha } = require('./kit/canvas');
 const { Diag } = require('./kit/diag');
 const Car = require('./kit/car');
@@ -28,6 +29,7 @@ const { Lights } = require('./lights');
 const { Control } = require('./control');
 const { Others } = require('./others');
 const { Strobe, gateChecks, gateWhy } = require('./strobe');
+const Packs = require('./packs');
 const Parked = require('./kit/parked');
 const { t: translate } = require('./kit/i18n');
 const { drawCabin } = require('./cabin');
@@ -150,8 +152,17 @@ mgu.run({
     async start(ctx) {
         const { ui, settings, log } = ctx;
         const { ambient, lights, control, active, others, strobe, checks } = ctx.background || await background(ctx);
-        // the Strobe tab only with its experimental setting on
-        const tabs = () => TABS.concat(settings.get('strobe') === true ? ['Strobe'] : []);
+        // the Strobe and Packs tabs only with their experimental setting on
+        const tabs = () => TABS.concat(settings.get('strobe') === true ? ['Strobe', 'Packs'] : []);
+        // the light packs (packs.js): the built-in ones and data/packs/*.json, read again each time the tab opens
+        const packDir = ctx.dataDir ? require('path').join(ctx.dataDir, 'packs') : null;
+        let packs = Packs.BUILT_IN, packSel = 0, packPage = 0, packsRead = 0;
+        const readPacks = () => {
+            if (!packDir || Date.now() - packsRead < 2000) return;
+            packsRead = Date.now();
+            packs = Packs.BUILT_IN.concat(Packs.load(packDir, log));
+            packSel = Math.min(packSel, packs.length - 1);
+        };
         // editing: null (the driver's own look) or a driving mode whose look the Colour and Animations tabs change
         let page = 0, part = 'all', dirty = true, editing = null;
         const T0 = Date.now();
@@ -469,10 +480,86 @@ mgu.run({
             }, { primary: showing, key: 'show-go', confirm: !showing, busy: !strobe || !strobe.kind || strobe.running === 'strobe' || strobe.running === 'learn' });
         }
 
+        /*
+         * Packs (only for use on private property, with the car standing still): named sequences of timed light steps
+         * (packs.js), run by the strobe's own ways to the lamps (Strobe.runPack): the built-in ones and your own
+         * (data/packs/*.json in the app's data folder, read when the tab opens). Tap a pack, Run (a press arms, a second
+         * starts), Loop runs it round and round (at most 60 s a press); Clear light faults clears the body controller's
+         * and the headlight units' fault memories (what a show may leave as lamp faults).
+         */
+        const FN_NAMES = { high: 'high beam', indL: 'indicator L', indR: 'indicator R', fog: 'front fog', cornL: 'cornering L',
+            cornR: 'cornering R', brake: 'brake', ess: 'brake flash', rearFog: 'rear fog', reverse: 'reverse', parkL: 'parking L',
+            parkR: 'parking R' };
+        const PER_PACK_PAGE = 12;
+        function packLights(p) {
+            const seen = [];
+            p.steps.forEach((s) => {
+                const names = s.job === 'fn' ? s.fns.map((f) => FN_NAMES[f]) : s.job === 'output' ? ['high beam outputs'] : s.job === 'disco' ? ['every lamp output'] : [];
+                names.forEach((n) => { if (seen.indexOf(n) < 0) seen.push(n); });
+            });
+            return seen;
+        }
+        function drawPacks(cv, t) {
+            const pages = Math.max(1, Math.ceil(packs.length / PER_PACK_PAGE));
+            packPage = Math.min(packPage, pages - 1);
+            G.panel(cv, t, 24, 44, 736, 468, 'Packs' + (pages > 1 ? '  ' + (packPage + 1) + '/' + pages : ''));
+            const running = strobe && strobe.running === 'pack';
+            packs.slice(packPage * PER_PACK_PAGE, (packPage + 1) * PER_PACK_PAGE).forEach((p, j) => {
+                const i = packPage * PER_PACK_PAGE + j, x = 44 + (j % 2) * 358, y = 96 + Math.floor(j / 2) * 58;
+                const sel = i === packSel, why = strobe ? strobe.packWhy(p) : 'not available';
+                cv.roundRect(x, y, 348, 50, 8, sel ? withAlpha(t.sel || t.accent, 0.35) : withAlpha('#ffffff', 0.06));
+                if (sel) cv.strokeRoundRect(x, y, 348, 50, 8, 1.5, t.sel || t.accent);
+                cv.text(p.title, x + 16, y + 32, 22, why ? t.dim : t.text, { font: 'bold' });
+                if (!p.builtIn) cv.text('YOURS', x + 332, y + 31, 14, t.dim, { align: 'right', font: 'bold', spacing: 1 });
+                if (cv.target && !running) cv.target(x, y, 348, 50, () => { packSel = i; return redraw(); }, 'pack-' + i, 8);
+            });
+            cv.text('Your own: data/packs/*.json in the app\'s data folder', 44, 486, 18, t.dim);
+            if (pages > 1) G.button(cv, t, 560, 452, 180, 42, 'More', () => { packPage = (packPage + 1) % pages; return redraw(); }, { key: 'packs-more' });
+
+            const p = packs[packSel];
+            G.panel(cv, t, 776, 44, 800, 468, p ? p.title : 'Packs');
+            if (!p) return;
+            if (p.errors) {
+                cv.text(fitText(cv, 'Not run: ' + p.errors[0], 18, 760), 796, 112, 18, t.warn);
+                if (p.file) cv.text(p.file, 796, 138, 18, t.dim);
+            } else {
+                if (p.description) cv.text(p.description, 796, 112, 20, t.dim);
+                const lit = packLights(p), n = p.steps.length;
+                cv.text(n + (n === 1 ? ' step' : ' steps') + ' · about ' + (Math.round(p.ms / 100) / 10) + ' s · ' + lit.slice(0, 4).join(', ')
+                    + (lit.length > 4 ? ' +' + (lit.length - 4) : ''), 796, 140, 18, t.dim);
+            }
+            const why = strobe ? strobe.packWhy(p) : 'not available';
+            checks().map((c) => [c[0], c[1]]).concat([[why ? 'Lamps: ' + why : 'Lamps: ' + strobe.kindName, !why]]).forEach(([label, ok], i) => {
+                const y = 182 + i * 26;
+                cv.arc(804, y - 6, 0, 7, 0, 360, ok ? '#2fd27a' : t.crit);
+                cv.text(fitText(cv, label, 20, 740), 822, y, 20, ok ? t.text : t.dim);
+            });
+            cv.text('Only for use on private property, parked.', 796, 300, 20, t.warn, { font: 'bold' });
+            if (running && strobe.pack) {
+                const f = strobe.pack.of ? strobe.pack.step / strobe.pack.of : 0;
+                cv.roundRect(796, 340, 760, 8, 4, t.track);
+                cv.roundRect(796, 340, Math.max(8, 760 * f), 8, 4, t.sel || t.accent);
+                cv.text('Step ' + strobe.pack.step + ' of ' + strobe.pack.of + (strobe.pack.pass ? ' · round ' + (strobe.pack.pass + 1) : ''), 796, 374, 18, t.dim);
+            } else if (strobe && strobe.note) {
+                cv.text(strobe.note, 796, 374, 18, strobe.noteType === 'warn' ? t.warn : t.dim);
+            }
+            const loop = settings.get('packLoop') === true;
+            const busy = !strobe || !!(strobe.running && !running);
+            G.button(cv, t, 796, 426, 140, 48, 'Loop', () => { settings.set('packLoop', !loop); return redraw(); }, { primary: loop, key: 'pack-loop' });
+            G.button(cv, t, 948, 426, 260, 48, 'Clear light faults', () => {
+                strobe.clearFaults().catch((e) => log.warn('light faults: ' + e));
+                return redraw();
+            }, { key: 'pack-clear', confirm: true, busy: busy || running });
+            G.button(cv, t, 1336, 426, 220, 48, running ? 'Stop' : 'Run', () => {
+                if (running) strobe.stop(); else strobe.runPack(p, { loop }).catch((e) => log.warn('pack: ' + e));
+                return redraw();
+            }, { primary: running, key: 'pack-go', confirm: !running, busy: !running && (busy || !!why) });
+        }
+
         async function render() {
             const t = ctx.theme(), cv = ctx.canvas(W, H).clear(t.bg);
             if (page >= tabs().length) page = 0;
-            [drawColour, drawAnimations, drawModes, drawFavs, drawStrobe][page](cv, t);
+            [drawColour, drawAnimations, drawModes, drawFavs, drawStrobe, drawPacks][page](cv, t);
             G.frame(cv, t, tabs(), page, []);
             dirty = false;
             await ui.image('MAIN_GFX', cv);
@@ -486,7 +573,7 @@ mgu.run({
         const PAUSE_KEY = 'strobe-tab', SEEN_MS = 1500;
         const animating = () => !!((lights.scene && S.moves(lights.scene)) || (lights._overs && lights._overs.size));
         const pauseCheck = () => {
-            const want = page === 4 && tabs().length > 4 && Date.now() - strobeSeen < SEEN_MS;
+            const want = page >= 4 && tabs().length > 4 && Date.now() - strobeSeen < SEEN_MS;
             if (want && !paused) {
                 paused = { moving: animating() };
                 log.info('ambient: ' + (paused.moving ? 'animation' : 'light updates') + ' paused for the Strobe tab');
@@ -502,10 +589,10 @@ mgu.run({
         setInterval(pauseCheck, 250);
         // moving lights redraw a few times a second, the rest when something changes
         const tick = () => {
-            if (page === 4) { strobeSeen = Date.now(); pauseCheck(); }
+            if (page >= 4) { strobeSeen = Date.now(); pauseCheck(); }
             const moving = (lights.scene && S.moves(lights.scene)) || (page === 1 && control.on() && S.moves(look()));
-            // (the Strobe tab: its checks follow the car, so it draws on each tick)
-            return dirty || (moving && page <= 1) || page === 4 ? render() : null;
+            // (the Strobe and Packs tabs: their checks follow the car, so they draw on each tick)
+            return dirty || (moving && page <= 1) || page >= 4 ? render() : null;
         };
 
         if (ctx.onTap) {
@@ -521,7 +608,7 @@ mgu.run({
                 return null;
             });
         }
-        ctx.onTab((i) => { page = i; if (i >= 2) editing = null; if (i === 4) strobeSeen = Date.now(); pauseCheck(); return redraw(); });
+        ctx.onTab((i) => { page = i; if (i >= 2) editing = null; if (i >= 4) strobeSeen = Date.now(); if (i === 5) readPacks(); pauseCheck(); return redraw(); });
         lights.on('change', () => { dirty = true; });
         ambient.on('change', () => { dirty = true; });
         others.on('change', () => { dirty = true; });
