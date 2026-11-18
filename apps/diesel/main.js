@@ -3,14 +3,16 @@
  * Diesel - the diesel particulate filter (DPF) and the rest of a B47 / B57's exhaust after-treatment, read from the
  * engine unit (DDE) over the head unit's diagnostic link, reading only (reader.js, kit/readonly-diag.js).
  *
- *   DPF            soot against the regeneration point, ash, the pressure drop, the heat into the filter; FILTER OK /
- *                  REGENERATION DUE / REGENERATING (keep driving) with the soot burnt; since the last one, the next one,
- *                  the count; the soot over the last 1,000 km (the app's own log)
- *   Regenerations  each one the app saw (when, the distance before it, how long, soot before / after, done or stopped),
- *                  else the engine unit's own last five (odometer, intervals)
- *   AdBlue         level and range, NOx before / after the SCR catalyst, how much of it goes, the catalyst's heat
- *   Engine         the EGR valves OPEN / CLOSED (how far, the target), air mass, rail pressure, boost, the injectors'
- *                  quantity corrections
+ *   DPF            one glance: FILTER OK / REGENERATION DUE / REGENERATING (keep driving, don't switch the engine off),
+ *                  the soot against the regeneration point, since the last one and the next; the heat into the filter,
+ *                  the pressure drop, ash; the EGR valves OPEN / CLOSED in short
+ *   Regenerations  each one the app saw (when, the distance before it, how long, soot before / after, peak, done or
+ *                  stopped; the one running first), else the engine unit's own last five (odometer, intervals); the
+ *                  totals and the soot over the last 1,000 km (the app's own log)
+ *   AdBlue         ADBLUE OK / REFILL SOON / REFILL NOW with the range; the level, NOx before / after the SCR catalyst,
+ *                  how much of it goes, the catalyst's heat
+ *   Engine         each EGR valve OPEN / CLOSED (how far, the target), EGR rate, air mass; rail pressure and boost against
+ *                  their targets, the injectors' quantity corrections
  *   Details        every value with its identifier, the reply's bytes and why one has none: what the car really sends
  *
  * In the background (app.json autostart; regen.js): while the engine runs, the filter's values every 20 s (5 s during a
@@ -20,8 +22,9 @@
 const fs = require('fs');
 const path = require('path');
 const mgu = require('./kit/mgu');
-const { withAlpha } = require('./kit/canvas');
+const { withAlpha, rgba } = require('./kit/canvas');
 const G = require('./kit/gauges');
+const { fitText } = require('./kit/text-layout');
 const Car = require('./kit/car');
 const Engine = require('./kit/engine');
 const { Reader } = require('./reader');
@@ -35,7 +38,7 @@ const TABS = ['DPF', 'Regenerations', 'AdBlue', 'Engine', 'Details'];
 const DPF_KEYS = ['soot', 'sootMeas', 'sootSim', 'ash', 'dp', 'tDpf', 'tDpfSens', 'tDoc', 'sinceKm', 'sinceS', 'sinceL', 'regens', 'avgKm', 'lifeKm',
     'pid8b', 'rgnNum', 'loadPct', 'avgStart', 'avgEnd'];
 const PAGE_KEYS = [
-    DPF_KEYS,
+    DPF_KEYS.concat(['egrHp', 'egrLp']),          // (the EGR valves' state in short, on the DPF page too)
     ['soot', 'tDpf', 'tDpfSens', 'sinceKm', 'regens', 'avgKm', 'pid8b', 'rgnNum', 'loadPct', 'avgStart', 'avgEnd'].concat(D.ODO),
     ['adLevel', 'adRange', 'adQual', 'adMass', 'noxIn', 'noxOut', 'scrT', 'tScr', 'scrEff'],
     ['egrHp', 'egrHpSet', 'egrLp', 'egrLpSet', 'egrRate', 'air', 'airSet', 'rail', 'railSet', 'boostAbs', 'boostSetAbs', 'ambient'].concat(D.INJ),
@@ -49,6 +52,15 @@ const AMBIENT_FLASH = process.env.MGU_AMBIENT_FLASH || '/dev/shm/mgu-ambient-fla
 const FLASH = { start: [255, 140, 0], complete: [0, 230, 90], stopped: [255, 40, 40] };
 const KM_MI = 0.621371;
 const AD_DENSITY = 1090;              // g per litre of AdBlue (32.5 % urea)
+const SCR_WARM_C = 180;               // deg C: the SCR catalyst converts from about here
+const AD_SOON_KM = 2400, AD_NOW_KM = 1000;    // AdBlue range: BMW's own reserve warning, and its urgent one
+const EGR_OPEN = 3;                   // % opening from which an EGR valve counts as open
+const INJ_WARN = 1, INJ_FULL = 1.5;   // mg/stroke: a correction past INJ_WARN is marked; its bar is full at INJ_FULL
+// the tiles' traces: the last 2 minutes, of readings no older than FRESH_MS, drawn from TRACE_MIN points on; a pause
+// longer than TRACE_GAP_MS (the background reads every 20 s) is a gap in the line
+const TRACE_S = 120, FRESH_MS = 6000, TRACE_MIN = 5, TRACE_GAP_MS = 25000;
+// the page grid (as Warm-Up): a wide left column, the state card right; PAD inside a card
+const LX = 24, LW = 880, RX = 928, RW = 648, PAD = 24;
 
 // the Details page's names
 const LABELS = {
@@ -154,15 +166,23 @@ mgu.run({
         settings.onChange(() => wanted());
         wanted();
 
-        // ---- short traces (the last 2 minutes) for the tiles
-        const trace = { t: [], dp: [], tIn: [] };
+        // ---- short traces (the last TRACE_S) for the tiles: [time, value], looked at once a second, a point for each
+        // new reading (a page's values stand still while another page is shown: no points then). On a steady clock: the
+        // head unit sets its own after start-up, and wall-clock times can jump by hours.
+        const mono = () => { const h = process.hrtime(); return h[0] * 1000 + h[1] / 1e6; };
+        const trace = { dp: [], tIn: [], nox: [], scr: [] };
         let traceT = 0;
         function sample(d) {
-            const now = Date.now();
-            if (now - traceT < 1000) return;
+            const now = mono(), since = traceT ? now - traceT : FRESH_MS;
+            if (since < 1000) return;
             traceT = now;
-            trace.t.push(now); trace.dp.push(d.dp); trace.tIn.push(d.tIn);
-            while (trace.t.length > 120) { trace.t.shift(); trace.dp.shift(); trace.tIn.shift(); }
+            const put = (name, value, key) => {
+                const a = trace[name], age = d.age(key);
+                // (read since the last look, and not long ago)
+                if (G.isNum(value) && age !== null && age < Math.min(FRESH_MS, since)) a.push([now, value]);
+                while (a.length && now - a[0][0] > TRACE_S * 1000) a.shift();
+            };
+            put('dp', d.dp, 'dp'); put('tIn', d.tIn, d.v('tDpf') !== null ? 'tDpf' : 'tDpfSens'); put('nox', d.noxIn, 'noxIn'); put('scr', d.scrT, 'scrT');
             if (demo()) {
                 // the demo's tracker is fed here (the background feeds the real one)
                 const s = src(), v = {};
@@ -182,12 +202,15 @@ mgu.run({
             // injectors: six when the fifth or sixth answers with something, else four (B47)
             const six = [v('inj5'), v('inj6')].some((x) => G.isNum(x) && Math.abs(x) > 0.005);
             const inj = D.INJ.slice(0, six ? 6 : 4).map((k) => v(k));
+            // the cylinder each of them belongs to (dde.js FIRING: they come in firing order), else as numbered
+            const firing = D.FIRING && D.FIRING[inj.length];
+            const injCyl = inj.map((q, i) => (firing && firing.length === inj.length ? firing[i] : i + 1));
             const noxIn = v('noxIn'), noxOut = v('noxOut'), scrT = v('scrT');
-            const conv = G.isNum(noxIn) && G.isNum(noxOut) && noxIn >= 20 && G.isNum(scrT) && scrT >= 180 ? G.clamp((1 - noxOut / noxIn) * 100, 0, 100) : null;
+            const conv = G.isNum(noxIn) && G.isNum(noxOut) && noxIn >= 20 && G.isNum(scrT) && scrT >= SCR_WARM_C ? G.clamp((1 - noxOut / noxIn) * 100, 0, 100) : null;
             const adLevel = v('adLevel') !== null ? v('adLevel') : v('adMass') !== null ? v('adMass') / AD_DENSITY : null;
             return {
                 demo: demo(), status: s.status(), diesel: s.diesel, family: s.family, verified: s.verified, index: s.index, scr: s.scr, scrIndex: s.scrIndex,
-                v, why,
+                v, why, age: (k) => (typeof s.age === 'function' ? s.age(k) : null),
                 soot: v('soot'), sootMeas: v('sootMeas'), sootSim: v('sootSim'), sootMax: st.threshold, thrBy: st.thresholdBy, load: st.load,
                 ash: v('ash'), lifeKm: v('lifeKm'), dp: v('dp'), tIn, tDoc: v('tDoc'),
                 phase: st.phase, by: st.by, requested: st.requested, run: st.run, nextKm: st.nextKm,
@@ -196,205 +219,452 @@ mgu.run({
                 adLevel, adLevelEst: v('adLevel') === null && v('adMass') !== null, adRange: v('adRange'), adQual: v('adQual'), noxIn, noxOut, scrT,
                 tScr: v('tScr'), scrEff: v('scrEff'), conv,
                 egrHp: { pos: v('egrHp'), target: v('egrHpSet'), why: why('egrHp') }, egrLp: { pos: v('egrLp'), target: v('egrLpSet'), why: why('egrLp') },
-                egrRate: v('egrRate'), air: v('air'), airTarget: v('airSet'), rail: v('rail'), railTarget: v('railSet'), boost, boostTarget: boostT, inj,
+                egrRate: v('egrRate'), air: v('air'), airTarget: v('airSet'), rail: v('rail'), railTarget: v('railSet'), boost, boostTarget: boostT, inj, injCyl,
             };
         }
 
         /* ---------- drawing ---------- */
 
-        /** A status row on the right: label left, value + unit right, a dim note under the label. */
-        function row(cv, t, y, label, value, unit, note, color) {
-            cv.text(label, 952, y, 22, t.dim, { font: 'bold', spacing: 1.5 });
-            if (note) cv.text(note, 952, y + 26, 20, t.dim);
+        const has = G.isNum;
+        const num = (x, dec) => (has(x) ? x.toFixed(dec || 0) : '--');
+        const big = (x) => (has(x) ? thousands(x) : '--');
+        const hm = (sec) => (has(sec) ? Math.floor(sec / 3600) + ' h ' + two(Math.floor(sec % 3600 / 60)) + ' min' : '');
+        const flow = (t) => t.accent2 || t.accent;          // an open valve, the gas through it
+        /** Text on a solid fill of col: dark on the light fills (amber, green, light blue), white on red. */
+        const inkOn = (t, col) => { const c = rgba(col); return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] > 130 ? t.bg : '#ffffff'; };
+        /** Tops of blocks of the heights hs between top and bottom, the same gap before, between and after them. */
+        function spread(top, bottom, hs) {
+            const gap = Math.max(0, (bottom - top - hs.reduce((a, b) => a + b, 0)) / (hs.length + 1)), out = [];
+            let y = top;
+            hs.forEach((h) => { y += gap; out.push(Math.round(y)); y += h; });
+            return out;
+        }
+
+        /** A card's row (x, w: the card's inside): label left, value + unit right, a dim note under the label. 48 high from 16 over y. */
+        function row(cv, t, x, w, y, label, value, unit, note, color) {
             const uw = unit ? cv.textWidth(' ' + unit, 24) : 0;
-            cv.text(value, 1552 - uw, y + 20, 44, value === '--' ? t.dim : color || t.text, { align: 'right', font: 'num' });
-            if (unit) cv.text(' ' + unit, 1552, y + 20, 24, t.dim, { align: 'right' });
-        }
-        const num = (x, dec) => (G.isNum(x) ? x.toFixed(dec || 0) : '--');
-        const big = (x) => (G.isNum(x) ? thousands(x) : '--');
-        const hm = (sec) => (G.isNum(sec) ? Math.floor(sec / 3600) + ' h ' + two(Math.floor(sec % 3600 / 60)) + ' min' : '');
-
-        /** The whole page as one message (not a diesel, no link...). */
-        function message(cv, t, head, line1, line2) {
-            G.panel(cv, t, 24, G.TOP, 1552, 468, null);
-            cv.text(head, 800, 250, 34, t.warn, { align: 'center', font: 'bold' });
-            if (line1) cv.text(line1, 800, 304, 24, t.dim, { align: 'center' });
-            if (line2) cv.text(line2, 800, 344, 22, t.dim, { align: 'center' });
-        }
-
-        function renderDpf(cv, t, d, now) {
-            // ---- soot: the regeneration starts at sootMax
-            const max = Math.max(10, Math.ceil(d.sootMax * 1.25 / 5) * 5);
-            G.segBar(cv, t, 24, G.TOP, 880, 225, {
-                label: 'Soot', value: d.soot, unit: 'g', decimals: 1, min: 0, max, step: max > 40 ? 2 : 1, scale: { every: max > 40 ? 10 : 5 },
-                zones: [{ from: d.sootMax * 0.9, to: max, color: 'warn' }], marks: [{ value: d.sootMax, color: t.warn }],
-            });
-            const pct = G.isNum(d.load) ? Math.round(d.load * 100) + ' % of the regeneration point' + (d.thrBy === 'typical' ? ' (typical)' : '') : '';
-            const sub = G.isNum(d.soot) ? (G.isNum(d.sootSim) ? 'model ' + d.sootSim.toFixed(1) + ' g' + (pct ? '  ·  ' : '') : '') + pct : d.why('soot');
-            cv.text(sub, 130, G.TOP + 41, 20, t.dim);
-
-            // ---- tiles: ash, the pressure drop, the heat into the filter
-            const ty = G.TOP + 242, th = 226;
-            G.stat(cv, t, 24, ty, 284, th, { label: 'Ash', value: d.ash, unit: 'g', decimals: 0, size: 64,
-                sub: G.isNum(d.lifeKm) ? 'filter life ' + big(Dk(d.lifeKm)) + ' ' + dU() : G.isNum(d.ash) ? 'oil ash, stays in' : d.why('ash') });
-            G.stat(cv, t, 322, ty, 284, th, { label: 'Pressure drop', value: d.dp, unit: 'hPa', decimals: 0, size: 64, history: trace.dp,
-                sub: G.isNum(d.dp) ? 'across the filter' : d.why('dp') });
-            G.stat(cv, t, 620, ty, 284, th, { label: 'Filter in', value: T(d.tIn), unit: tU(), decimals: 0, size: 64, history: trace.tIn.map(T),
-                sub: G.isNum(d.tDoc) ? 'oxi cat in ' + Math.round(T(d.tDoc)) + tU() : d.why('tDpf'), zones: [{ from: T(Regen.REGEN_C), to: T(1200), color: 'warn' }] });
-
-            // ---- the regeneration
-            const sp = G.panel(cv, t, 928, G.TOP, 648, 468, null);
-            const regen = d.phase === 'active', due = d.phase === 'due';
-            const st = regen ? 'REGENERATING' : due ? 'REGENERATION DUE' : d.phase === 'ok' ? 'FILTER OK' : 'NO DATA YET';
-            const col = regen || due ? t.warn : d.phase === 'ok' ? GO : t.dim;
-            cv.roundRect(952, 70, 600, 60, 10, withAlpha(col, 0.22));
-            if (regen) cv.roundRect(952, 70, 600, 60, 10, withAlpha(col, 0.12 + 0.1 * Math.sin(now / 300)));
-            cv.text(st, 1252, 114, 38, col, { align: 'center', font: 'bold', spacing: 3 });
-            if (regen) {
-                const r = d.run;
-                cv.text('Keep driving, don\'t switch the engine off', 952, 170, 24, t.text, { font: 'bold' });
-                cv.text('SOOT BURNT', 952, 214, 22, t.dim, { font: 'bold', spacing: 1.5 });
-                cv.text(G.isNum(r.progress) ? Math.round(r.progress * 100) + ' %' : '--', 1552, 216, 30, t.text, { align: 'right', font: 'num' });
-                cv.roundRect(952, 228, 600, 12, 6, t.track);
-                if (G.isNum(r.progress) && r.progress > 0) cv.rampRect(952, 228, Math.max(12, 600 * r.progress), 12, 6, [t.warn, GO], 952, 600);
-                row(cv, t, 280, 'RUNNING FOR', String(Math.floor(r.s / 60)), 'min',
-                    num(Dk(r.km), 0) + ' ' + dU() + (G.isNum(r.soot0) ? '  ·  started at ' + r.soot0.toFixed(1) + ' g' : '') + (r.by === 'heat' ? '  ·  by the heat' : ''));
-            } else if (due) {
-                cv.text(d.requested ? 'The engine has asked for one' : 'The soot is at the regeneration point', 952, 170, 24, t.text, { font: 'bold' });
-                cv.text('20-30 min at a steady 60 km/h or more lets it run', 952, 202, 22, t.dim);
-                row(cv, t, 250, 'SINCE LAST REGENERATION', big(Dk(d.sinceKm)), dU(), hm(d.sinceS) + (d.sinceS ? ' of driving' : ''));
-            } else {
-                row(cv, t, 170, 'SINCE LAST REGENERATION', big(Dk(d.sinceKm)), dU(), G.isNum(d.sinceS) ? hm(d.sinceS) + ' of driving' : d.why('sinceKm'));
-                row(cv, t, 240, 'NEXT REGENERATION', G.isNum(d.nextKm) ? '~' + big(Dk(d.nextKm)) : '--', dU(), G.isNum(d.avgKm) ? 'from the average of ' + big(Dk(d.avgKm)) + ' ' + dU() : '');
-                row(cv, t, 310, 'REGENERATIONS', big(d.regens), '', G.isNum(d.regens) ? 'successful, in the engine unit' : d.why('regens'));
-            }
-            // ---- the soot over the last 1,000 km (the app's own log): the sawtooth of the regenerations
-            const gy = 384, gh = sp.y + sp.h - gy - 22, span = Dk(Regen.HIST_KM);
-            cv.text('SOOT, LAST ' + Math.round(span) + ' ' + dU().toUpperCase(), 952, gy - 8, 18, t.dim, { font: 'bold', spacing: 1.5 });
-            G.chart(cv, t, 952, gy, 600, gh, { xMin: -span, xMax: 0, yMin: 0, yMax: Math.max(30, Math.ceil(d.sootMax / 10 + 0.3) * 10), yStep: 10, xStep: MI() ? 200 : 250,
-                padLeft: 34, xUnit: dU(), empty: 'logged as you drive', marks: [{ y: d.sootMax, color: t.warn }],
-                series: [{ pts: d.hist.map((p) => [Dk(p[0]), p[1]]), color: t.accent2 || t.accent, fill: true }] });
-        }
-
-        function renderRegens(cv, t, d) {
-            const p = G.panel(cv, t, 24, G.TOP, 1552, 468, 'Regenerations');
-            const day = (ms) => { const a = new Date(ms); return a.getDate() + '.' + two(a.getMonth() + 1) + '.  ' + a.getHours() + ':' + two(a.getMinutes()); };
-            if (d.log.length) {
-                const rows = d.log.slice(0, 5).map((e) => [day(e.t0), G.isNum(e.interval) ? big(Dk(e.interval)) + ' ' + dU() : '--', Math.max(1, Math.round(e.s / 60)) + ' min',
-                    num(Dk(e.km), 0) + ' ' + dU(), (G.isNum(e.soot0) ? e.soot0.toFixed(1) : '?') + '  to  ' + (G.isNum(e.soot1) ? e.soot1.toFixed(1) : '?') + ' g',
-                    G.isNum(e.peak) ? Math.round(T(e.peak)) + tU() : '--', { text: e.result === 'complete' ? 'done' : 'stopped early', color: e.result === 'complete' ? GO : 'warn' }]);
-                G.table(cv, t, 48, 104, 1500, [{ label: 'Started', w: 230 }, { label: 'After', w: 190, align: 'right' }, { label: 'Took', w: 160, align: 'right' },
-                    { label: 'Distance', w: 180, align: 'right' }, { label: 'Soot', w: 300, align: 'right' }, { label: 'Peak', w: 170, align: 'right' },
-                    { label: '', w: 270, align: 'right', font: 'bold' }], rows, { rowH: 54, size: 26 });
-            } else {
-                // nothing seen here yet: the engine unit's own last five (odometer at each, the distances between them)
-                const odo = d.odo.filter(G.isNum);
-                const rows = odo.map((km, i) => [i === 0 ? 'Last' : i === 1 ? 'The one before' : (i + 1) + ' back', big(Dk(km)) + ' ' + dU(),
-                    i + 1 < odo.length ? big(Dk(km - odo[i + 1])) + ' ' + dU() : '--']);
-                G.table(cv, t, 48, 104, 900, [{ label: 'Regeneration', w: 300 }, { label: 'At', w: 300, align: 'right' }, { label: 'After', w: 300, align: 'right' }],
-                    rows, { rowH: 54, size: 26, empty: d.why('odo1') });
-                cv.text('Each regeneration from now on is logged with', 1000, 160, 22, t.dim);
-                cv.text('its time, soot and heat, also with the app closed.', 1000, 190, 22, t.dim);
-            }
-            const stopped = d.log.slice(0, 5).filter((e) => e.result !== 'complete').length;
-            cv.text((G.isNum(d.regens) ? big(d.regens) + ' regenerations in the engine unit' : 'regenerations: ' + d.why('regens')) +
-                (G.isNum(d.avgKm) ? '  ·  one every ' + big(Dk(d.avgKm)) + ' ' + dU() + ' on average' : '') +
-                (stopped ? '  ·  ' + stopped + ' of the last ' + Math.min(5, d.log.length) + ' stopped early' : ''), 48, p.y + p.h - 22, 22, t.dim);
-        }
-
-        function renderAdblue(cv, t, d) {
-            const none = !d.demo && d.why('adRange') === 'not on this car' && d.why('noxIn') === 'not on this car';
-            if (none) return message(cv, t, 'No AdBlue system on this car', 'The engine unit has no SCR catalyst values (a B47 without AdBlue).');
-            G.segBar(cv, t, 24, G.TOP, 880, 225, { label: 'AdBlue', value: d.adLevel, unit: 'l', decimals: 1, min: 0, max: 20, step: 1, scale: { every: 5 },
-                marks: [{ value: 3, color: t.crit }] });
-            const range = G.isNum(d.adRange) ? 'range about ' + big(Dk(d.adRange)) + ' ' + dU() : d.why('adRange');
-            cv.text(range + (d.adLevelEst ? '  ·  level from the engine unit (estimate)' : G.isNum(d.adLevel) ? '' : '  ·  level: ' + d.why('adLevel')), 170, G.TOP + 41, 20, t.dim);
-            const ty = G.TOP + 242, th = 226;
-            G.stat(cv, t, 24, ty, 284, th, { label: 'NOx in', value: d.noxIn, unit: 'ppm', size: 64, sub: G.isNum(d.noxIn) ? 'before the SCR' : d.why('noxIn') });
-            G.stat(cv, t, 322, ty, 284, th, { label: 'NOx out', value: d.noxOut, unit: 'ppm', size: 64, sub: G.isNum(d.noxOut) ? 'after the SCR' : d.why('noxOut') });
-            G.stat(cv, t, 620, ty, 284, th, { label: 'SCR', value: T(d.scrT), unit: tU(), size: 64, sub: G.isNum(d.scrT) ? 'catalyst temperature' : d.why('scrT') });
-            G.panel(cv, t, 928, G.TOP, 648, 468, 'Conversion');
-            G.ring(cv, t, 1252, 250, 130, { value: d.conv, max: 100, decimals: 0, unit: '%', label: 'NOx removed now', color: GO });
-            cv.text(G.isNum(d.scrEff) ? 'average ' + d.scrEff.toFixed(1) + ' %' + (G.isNum(d.adQual) ? '  ·  AdBlue quality ' + d.adQual.toFixed(1) + ' %' : '') :
-                G.isNum(d.conv) ? '' : 'needs a warm catalyst and both NOx sensors', 1252, 470, 22, t.dim, { align: 'center' });
+            const vw = cv.text(value, x + w - uw, y + 20, 44, value === '--' ? t.dim : color || t.text, { align: 'right', font: 'num' });
+            if (unit) cv.text(' ' + unit, x + w, y + 20, 24, t.dim, { align: 'right' });
+            cv.text(label, x, y, 22, t.dim, { font: 'bold', spacing: 1.5 });
+            if (note) cv.text(fitText(cv, note, 20, w - vw - uw - 24), x, y + 26, 20, t.dim);
         }
 
         /**
-         * An EGR valve seen along the flow: the pipe, its butterfly plate turning on a horizontal shaft (closed = the
-         * plate fills the pipe, fully open = edge on), the gas let through glowing around it. open = 0..1 or null.
+         * A state in one word on its colour (Warm-Up's banner): 'tint' = the word in col on a tint of it (all is well),
+         * 'ring' = that with an outline (look here), 'fill' = filled (it is on), 'pulse' = filled and breathing (it is
+         * running: nothing else on the screen looks like it), 'plain' = white on grey (off, closed), 'off' = no state.
          */
-        function valve(cv, t, cx, cy, r, open, col) {
-            const known = G.isNum(open), f = known ? G.clamp(open, 0, 1) : 0;
-            // the ring: how far open, 0..100 %
-            cv.arc(cx, cy, r + 4, r + 16, 0, 360, t.track);
-            if (known && f > 0.005) cv.arc(cx, cy, r + 4, r + 16, 0, f * 360, col, { round: true });
-            cv.circle(cx, cy, r, withAlpha('#000000', 0.35));
-            if (known && f > 0.02) cv.circle(cx, cy, r, withAlpha(col, 0.2 + 0.3 * f));
-            // the plate: an ellipse as horizontal strips (quads), as high as the valve is closed (edge on when fully open)
-            const rx = r - 3, ry = Math.max(3, rx * (1 - f)), N = 24, pc = known ? withAlpha('#c9d0da', 0.9) : withAlpha(t.tick, 0.5);
-            const half = (y) => rx * Math.sqrt(Math.max(0, 1 - (y / ry) * (y / ry)));
-            for (let k = 0; k < N; k++) {
-                const y0 = -ry + 2 * ry * k / N, y1 = -ry + 2 * ry * (k + 1) / N, w0 = half(y0), w1 = half(y1);
-                cv.quad([[cx - w0, cy + y0], [cx + w0, cy + y0], [cx + w1, cy + y1], [cx - w1, cy + y1]], pc);
+        function banner(cv, t, x, y, w, h, word, col, how, now) {
+            const r = Math.min(10, h / 2), o = { align: 'center', font: 'bold', spacing: h >= 56 ? 3 : 2 };
+            let size = h >= 56 ? 38 : 28, ink = col;
+            if (cv.textWidth(word, size, o) > w - 32) size = Math.round(size * 0.8);
+            if (how === 'pulse') cv.roundRect(x - 6, y - 6, w + 12, h + 12, r + 6, withAlpha(col, 0.2 + 0.16 * Math.sin((now || 0) / 380)));
+            if (how === 'pulse' || how === 'fill') { cv.roundRect(x, y, w, h, r, col); ink = inkOn(t, col); }
+            else if (how === 'plain') { cv.roundRect(x, y, w, h, r, withAlpha('#ffffff', 0.1)); ink = t.text; }
+            else if (how === 'off') { cv.roundRect(x, y, w, h, r, withAlpha(t.dim, 0.16)); ink = t.dim; }
+            else {
+                cv.roundRect(x, y, w, h, r, withAlpha(col, 0.22));
+                if (how === 'ring') cv.strokeRoundRect(x, y, w, h, r, 2, col);
             }
-            cv.line(cx - r - 26, cy, cx + r + 26, cy, 5, t.tick);
-            cv.circle(cx, cy, 7, t.dim);
+            cv.text(word, x + w / 2, y + h / 2 + size * 0.36, size, ink, o);
         }
 
-        /** One EGR valve with its state: OPEN / CLOSED, the opening and the engine unit's target. */
-        function egr(cv, t, cx, label, v) {
-            const has = G.isNum(v.pos), open = has && v.pos >= 3, col = open ? (t.accent2 || t.accent) : t.dim, absent = !has && v.why === 'not on this car';
-            cv.text(label, cx, 104, 22, t.dim, { align: 'center', font: 'bold', spacing: 1.5 });
-            valve(cv, t, cx, 228, 92, has ? v.pos / 100 : null, col);
-            cv.text(has ? (open ? 'OPEN' : 'CLOSED') : absent ? 'NOT FITTED' : '--', cx, 396, 40, has && open ? t.text : t.dim, { align: 'center', font: 'bold', spacing: 3 });
-            if (has) {
-                cv.text(String(Math.round(Math.max(0, v.pos))), cx - 10, 452, 44, t.text, { align: 'right', font: 'num' });
-                cv.text('%', cx - 4, 452, 24, t.dim);
-                if (G.isNum(v.target)) cv.text('target ' + Math.round(Math.max(0, v.target)) + ' %', cx + 40, 450, 22, t.dim);
-            } else if (!absent) cv.text(v.why, cx, 446, 22, t.dim, { align: 'center' });
+        /** A slim bar (Warm-Up's cool-down): f = 0..1 of it filled in col, a colour or a ramp's stops along the whole bar. */
+        function meter(cv, t, x, y, w, h, f, col) {
+            cv.roundRect(x, y, w, h, h / 2, t.track);
+            if (!has(f) || f <= 0) return;
+            const fw = Math.max(h, w * G.clamp(f, 0, 1));
+            if (Array.isArray(col) && typeof col[0] === 'string') cv.rampRect(x, y, fw, h, h / 2, col, x, w);
+            else cv.roundRect(x, y, fw, h, h / 2, col);
         }
 
-        function renderEngine(cv, t, d) {
-            const p = G.panel(cv, t, 24, G.TOP, 880, 468, 'EGR');
-            egr(cv, t, 244, 'HIGH PRESSURE', d.egrHp);
-            egr(cv, t, 684, 'LOW PRESSURE', d.egrLp);
-            const line = (G.isNum(d.egrRate) ? 'exhaust gas let back in  ' + Math.round(d.egrRate) + ' %' : '') +
-                (G.isNum(d.air) ? (G.isNum(d.egrRate) ? '  ·  ' : '') + 'air mass ' + Math.round(d.air) + (G.isNum(d.airTarget) ? ' of ' + Math.round(d.airTarget) : '') + ' mg/stroke' : '');
-            cv.text(line, 464, p.y + p.h - 22, 20, t.dim, { align: 'center' });
-            G.panel(cv, t, 928, G.TOP, 648, 468, 'Engine');
-            G.bar(cv, t, 952, 92, 600, 96, { label: 'Rail pressure', value: d.rail, unit: 'bar', max: 2500, step: 500, peak: d.railTarget, decimals: 0 });
-            G.bar(cv, t, 952, 200, 600, 96, { label: 'Boost', value: d.boost, unit: 'bar', decimals: 2, max: 3, step: 0.5, peak: d.boostTarget });
-            cv.text('INJECTOR CORRECTION', 952, 340, 22, t.dim, { font: 'bold', spacing: 1.5 });
-            const iw = cv.textWidth('INJECTOR CORRECTION', 22, { font: 'bold', spacing: 1.5 });
-            cv.text('mg/stroke, at warm idle', 952 + iw + 14, 340, 20, t.dim);
-            const zy = 400, n = d.inj.length, cw = 600 / n;
-            cv.fillRect(952, zy, 600, 2, t.tick);
-            d.inj.forEach((q, i) => {
-                const x = 952 + i * cw + cw / 2, has = G.isNum(q), hgt = has ? G.clamp(q / 1.5, -1, 1) * 34 : 0, c = has && Math.abs(q) > 1 ? t.warn : t.accent2 || t.accent;
-                if (has) cv.fillRect(x - 22, hgt > 0 ? zy - hgt : zy + 2, 44, Math.max(2, Math.abs(hgt)), c);
-                cv.text(has ? (q > 0 ? '+' : '') + q.toFixed(1) : '--', x, 466, 24, has && Math.abs(q) > 1 ? t.warn : has ? t.text : t.dim, { align: 'center', font: 'bold' });
-                cv.text(String(i + 1), x, 494, 18, t.dim, { align: 'center' });
+        /**
+         * A trace over the last TRACE_S, now at the right edge: pts = [[time, value]] (sample), base y = yb, h high. It
+         * shows at least minSpan of the value's unit, so a steady value is a level line and not its noise blown up;
+         * a long pause in the readings (another page was shown) is a gap. conv: to the shown unit.
+         */
+        function spark(cv, t, x, yb, w, h, pts, col, conv, minSpan) {
+            const now = mono(), v = pts.map((p) => [p[0], conv ? conv(p[1]) : p[1]]).filter((p) => has(p[1]) && now - p[0] <= TRACE_S * 1000);
+            if (v.length < TRACE_MIN || h < 16) return;
+            let lo = Math.min.apply(null, v.map((p) => p[1])), hi = Math.max.apply(null, v.map((p) => p[1]));
+            if (hi - lo < minSpan) { const mid = (hi + lo) / 2; lo = mid - minSpan / 2; hi = mid + minSpan / 2; }
+            const P = (p) => [x + w - (now - p[0]) / (TRACE_S * 1000) * w, yb - 3 - (p[1] - lo) / (hi - lo) * (h - 3)];
+            cv.fillRect(x, yb, w, 1, withAlpha(t.tick, 0.5));
+            let run = [];
+            const draw = () => { if (run.length > 1) { cv.fillUnder(run, yb, withAlpha(col, 0.16)); cv.polyline(run, 2.5, withAlpha(col, 0.85)); } run = []; };
+            v.forEach((p, i) => { if (i && p[0] - v[i - 1][0] > TRACE_GAP_MS) draw(); run.push(P(p)); });
+            draw();
+        }
+
+        /**
+         * A tile as G.stat draws them (title, the value big with its unit, a trace, a last line), and with them: a second,
+         * smaller value top right under its label (as M Vitals' target), a bar in place of the trace, or a labelled value
+         * at the bottom. g = { label, value, unit, decimals, color, side: { label, value }, trace, conv, minSpan,
+         * meter: { f, color }, foot: { label, text }, sub }.
+         */
+        function tile(cv, t, x, y, w, h, g) {
+            const p = G.panel(cv, t, x, y, w, h, g.label), yb = p.y + p.h, r = x + w - 18, v = g.value, vy = y + 102;
+            const vw = cv.text(has(v) ? G.fmt(v, g.decimals) : '--', x + 18, vy, 64, has(v) ? g.color || t.text : t.dim, { font: 'num' });
+            let end = x + 26 + vw;
+            if (g.unit) end += cv.text(g.unit, end, vy, 28, t.dim);
+            if (g.side && has(g.side.value)) {
+                // (left out where the big value leaves it no room)
+                const ss = G.fmt(g.side.value, g.decimals), size = cv.textWidth(ss, 36, { font: 'num' }) <= r - end - 14 ? 36 : 28;
+                const lw = cv.textWidth(g.side.label, 18, { font: 'bold', spacing: 1.5 });
+                if (cv.textWidth(ss, size, { font: 'num' }) <= r - end - 10 && r - lw >= x + 18 + vw + 6) {
+                    cv.text(g.side.label, r, y + 68, 18, t.dim, { align: 'right', font: 'bold', spacing: 1.5 });
+                    cv.text(ss, r, vy, size, t.text, { align: 'right', font: 'num' });
+                }
+            }
+            const base = yb - 50;                 // of the trace / the bar, over the last line
+            if (g.trace) spark(cv, t, x + 18, base, w - 36, Math.min(84, base - vy - 14), g.trace, g.color || t.accent, g.conv, g.minSpan);
+            if (g.meter) meter(cv, t, x + 18, base - 14, w - 36, 14, g.meter.f, g.meter.color);
+            if (g.foot) {
+                cv.text(g.foot.label, x + 18, yb - 58, 18, t.dim, { font: 'bold', spacing: 1.5 });
+                cv.text(g.foot.text, x + 18, yb - G.MARGIN, 28, t.text, { font: 'bold' });
+            } else if (g.sub) cv.text(fitText(cv, g.sub, 22, w - 36, { spacing: 0.5 }), x + 18, yb - G.MARGIN, 22, t.dim, { spacing: 0.5 });
+        }
+        const traced = (pts) => pts.length >= TRACE_MIN;      // a trace is drawn (sample() keeps the last TRACE_S of it)
+        /** A value that has none yet is still on its way (not refused, missing or silent). */
+        const waiting = (d, key) => d.status === 'IDENTIFYING' || d.why(key) === 'reading...';
+
+        /** The whole page as one message (not a diesel, no link...); col: the headline's colour (a warning's without). */
+        function message(cv, t, head, line1, line2, col) {
+            const p = G.panel(cv, t, LX, G.TOP, W - 2 * LX, 468, null), dy = Math.round((p.h - 468) / 2);
+            cv.text(head, W / 2, 250 + dy, 34, col || t.warn, { align: 'center', font: 'bold' });
+            if (line1) cv.text(line1, W / 2, 304 + dy, 24, t.dim, { align: 'center' });
+            if (line2) cv.text(line2, W / 2, 344 + dy, 22, t.dim, { align: 'center' });
+        }
+
+        /* ---------- DPF ---------- */
+
+        /** The filter's state: its word, colour and banner (banner()). */
+        function dpfState(t, d) {
+            if (d.phase === 'active') return { key: 'active', word: 'REGENERATING', col: t.warn, how: 'pulse' };
+            if (d.phase === 'due') return { key: 'due', word: 'REGENERATION DUE', col: t.warn, how: 'ring' };
+            if (d.phase === 'ok') return { key: 'ok', word: 'FILTER OK', col: GO, how: 'tint' };
+            return { key: 'none', word: waiting(d, 'soot') ? 'NO DATA YET' : 'NO SOOT VALUE', col: t.dim, how: 'off' };
+        }
+
+        /**
+         * The soot bar's scale: the regeneration point at about 4/5 of it, further for a filter loaded past that. It keeps
+         * the scale it has while that still fits (the regeneration point worked out from the load % moves a little with
+         * every reading: a scale that followed it would jump between 30 and 35).
+         */
+        let sootTop = 0;
+        function sootScale(lim, soot) {
+            const need = Math.max(10, lim ? lim * 1.2 : 30, has(soot) ? soot * 1.08 : 0);
+            if (!sootTop || need > sootTop || need < sootTop * 0.72) {
+                const every = need <= 40 ? 5 : need <= 80 ? 10 : need <= 160 ? 20 : 50;
+                sootTop = Math.ceil(need / every - 1e-9) * every;
+            }
+            return { max: sootTop, every: sootTop <= 40 ? 5 : sootTop <= 80 ? 10 : sootTop <= 160 ? 20 : 50 };
+        }
+
+        /** The soot as a tach bar: the regeneration point marked and named, amber from just before it, all amber while it burns. */
+        function sootBar(cv, t, d, st, h) {
+            const x = LX, y = G.TOP, w = LW, lim = has(d.sootMax) && d.sootMax > 0 ? d.sootMax : null;
+            const sc = sootScale(lim, d.soot), max = sc.max, every = sc.every, step = every / 2;
+            G.segBar(cv, t, x, y, w, h, {
+                label: 'Soot', value: d.soot, unit: 'g', decimals: 1, min: 0, max, step, scale: { every }, color: st.key === 'active' ? 'warn' : undefined,
+                zones: lim ? [{ from: Math.round(lim * 0.9 / step) * step, to: max, color: 'warn' }] : [], marks: lim ? [{ value: lim, color: t.warn }] : [],
+            });
+            // beside the title: the soot's two sources (the big number is what the engine unit regenerates by)
+            const note = has(d.soot) ? [has(d.sootMeas) && 'measured ' + d.sootMeas.toFixed(1) + ' g', has(d.sootSim) && 'model ' + d.sootSim.toFixed(1) + ' g'].filter(Boolean).join('  ·  ') : d.why('soot');
+            cv.text(note, x + 40 + cv.textWidth('Soot', 26, { font: 'bold' }), y + 42, 20, t.dim);
+            if (!lim) return;
+            // the mark's name, at it (G.segBar's bar: from x + 24, w - 66 long, its top edge 18 further right, 80 under the top)
+            const mx = x + 42 + G.clamp(lim / max, 0, 1) * (w - 66), name = 'regeneration at ' + (d.thrBy === 'typical' ? 'about ' : '') + Math.round(lim) + ' g';
+            const left = mx - 10 - cv.textWidth(name, 20) >= x + 24;
+            cv.text(name, left ? mx - 10 : mx + 10, y + 70, 20, t.dim, { align: left ? 'right' : 'left' });
+        }
+
+        /**
+         * The EGR valves in short, along a card's bottom (yb): OPEN (in the flow's colour) / CLOSED with the opening, for
+         * each valve the car has; quiet, so the card's own state stays the loudest. Returns where it starts (its line),
+         * yb without a valve.
+         */
+        function egrStrip(cv, t, x, w, yb, d) {
+            const vs = [['EGR HIGH PRESSURE', d.egrHp], ['EGR LOW PRESSURE', d.egrLp]].filter((v) => has(v[1].pos) || v[1].why !== 'not on this car');
+            if (!vs.length) return yb;
+            const gap = 16, cw = (w - gap * (vs.length - 1)) / vs.length, y = yb - 46;
+            cv.fillRect(x, y - 50, w, 1, withAlpha(t.tick, 0.6));
+            vs.forEach((v, i) => {
+                const cx = x + i * (cw + gap), pos = v[1].pos, open = has(pos) && pos >= EGR_OPEN, col = flow(t), ink = open ? col : has(pos) ? t.text : t.dim;
+                cv.text(vs.length > 1 ? v[0] : 'EGR VALVE', cx, y - 12, 22, t.dim, { font: 'bold', spacing: 1.5 });
+                cv.roundRect(cx, y, cw, 46, 10, open ? withAlpha(col, 0.34) : withAlpha(has(pos) ? '#ffffff' : t.dim, has(pos) ? 0.1 : 0.16));
+                cv.text(has(pos) ? (open ? 'OPEN' : 'CLOSED') : '--', cx + 18, y + 33, 28, ink, { font: 'bold', spacing: 2 });
+                cv.text(has(pos) ? Math.round(Math.max(0, pos)) + ' %' : fitText(cv, v[1].why, 22, cw - 90), cx + cw - 18, y + 33, has(pos) ? 28 : 22, ink, { align: 'right', font: has(pos) ? 'bold' : 'label' });
+            });
+            return y - 50;
+        }
+
+        /** The filter's card: the state, what to do about it, what it comes from; the EGR valves along the bottom. */
+        function dpfCard(cv, t, d, st, now) {
+            const sp = G.panel(cv, t, RX, G.TOP, RW, 468, null), x = RX + PAD, w = RW - 2 * PAD, bot = sp.y + sp.h;
+            banner(cv, t, x, G.TOP + 26, w, 60, st.word, st.col, st.how, now);
+            const floor = egrStrip(cv, t, x, w, bot - G.MARGIN, d);
+            let top = G.TOP + 86;
+            /** two lines under the banner: what to do (large for the one that matters while driving) */
+            const head = (a, b, large) => {
+                cv.text(a, x, top + (large ? 52 : 46), large ? 40 : 30, t.text, { font: 'bold' });
+                cv.text(b, x, top + (large ? 86 : 78), large ? 26 : 24, large ? t.text : t.dim, { font: large ? 'bold' : 'label' });
+                top += large ? 98 : 90;
+            };
+            const pct = has(d.load) ? Math.round(d.load * 100) : null;
+            const load = { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'SOOT LOAD', pct === null ? '--' : String(pct), '%',
+                pct === null ? d.why('soot') : 'of the regeneration point' + (has(d.sootMax) ? ', ' + (d.thrBy === 'typical' ? 'about ' : '') + Math.round(d.sootMax) + ' g' : ''), pct !== null && pct >= 100 ? t.warn : null) };
+            const since = { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'SINCE LAST REGENERATION', big(Dk(d.sinceKm)), dU(),
+                has(d.sinceKm) ? (has(d.sinceS) ? hm(d.sinceS) + ' of driving' : '') : d.why('sinceKm')) };
+            const next = { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'NEXT ONE IN ABOUT', big(Dk(d.nextKm)), dU(),
+                has(d.nextKm) ? (d.nextKm > 0 ? 'by' : 'past') + ' the average of ' + big(Dk(d.avgKm)) + ' ' + dU() + ' between them' : has(d.sinceKm) ? d.why('avgKm') : '') };
+            let blocks = [load, since, next];
+            if (st.key === 'active') {
+                const r = d.run || {};
+                head('Keep driving', 'Don\'t switch the engine off', true);
+                blocks = [{ h: 68, draw: (y) => {
+                    row(cv, t, x, w, y + 16, 'SOOT BURNT', has(r.progress) ? String(Math.round(r.progress * 100)) : '--', '%');
+                    meter(cv, t, x, y + 52, w, 16, r.progress, [t.warn, GO]);
+                } }, { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'RUNNING FOR', !has(r.s) ? '--' : String(r.s < 60 ? Math.max(0, r.s) : Math.floor(r.s / 60)), has(r.s) && r.s < 60 ? 's' : 'min',
+                    [has(r.km) && num(Dk(r.km), 0) + ' ' + dU(), has(r.soot0) && 'started at ' + r.soot0.toFixed(1) + ' g', r.by === 'heat' && 'seen by its heat'].filter(Boolean).join('  ·  ')) }];
+            } else if (st.key === 'due') {
+                head(d.requested ? 'The engine has asked for one' : pct !== null && pct >= 125 ? 'The soot is well past the regeneration point' : 'The soot is at the regeneration point',
+                    '20-30 min at a steady ' + (MI() ? '40 mph' : '60 km/h') + ' or more lets it run');
+                blocks = [load, since];
+            }
+            const ys = spread(top, floor, blocks.map((b) => b.h));
+            blocks.forEach((b, i) => b.draw(ys[i]));
+        }
+
+        function renderDpf(cv, t, d, now) {
+            // the room below the page (on the car, with no bar under it): half to the soot, half to the tiles
+            const half = Math.round((G.pageBottom(cv) - G.BOTTOM) / 2), st = dpfState(t, d);
+            sootBar(cv, t, d, st, 225 + half);
+            // ---- tiles: the heat into the filter (a regeneration's tell-tale), the pressure drop, ash
+            const ty = G.TOP + 242 + half, th = 226 - half, tw = 280, hot = has(d.tIn) && d.tIn >= Regen.REGEN_C;
+            tile(cv, t, LX, ty, tw, th, { label: 'Before the filter', value: T(d.tIn), unit: tU(), color: hot ? t.warn : null, side: { label: 'OXI CAT', value: T(d.tDoc) },
+                trace: trace.tIn, conv: T, minSpan: F() ? 108 : 60, sub: has(d.tIn) ? (traced(trace.tIn) ? 'last 2 min' : 'exhaust temperature') : d.why('tDpf') });
+            tile(cv, t, LX + 300, ty, tw, th, { label: 'Pressure drop', value: d.dp, unit: 'hPa', trace: trace.dp, minSpan: 10,
+                sub: has(d.dp) ? (traced(trace.dp) ? 'last 2 min' : 'across the filter') : d.why('dp') });
+            tile(cv, t, LX + 600, ty, tw, th, { label: 'Ash', value: d.ash, unit: 'g', foot: has(d.ash) && has(d.lifeKm) ? { label: 'FILTER LIFE LEFT', text: big(Dk(d.lifeKm)) + ' ' + dU() } : null,
+                sub: has(d.ash) ? 'oil ash, stays in the filter' : d.why('ash') });
+            dpfCard(cv, t, d, st, now);
+        }
+
+        /* ---------- Regenerations ---------- */
+
+        function renderRegens(cv, t, d) {
+            const lw = 1040, rx = LX + lw + 24, rw = W - LX - rx, x = LX + PAD, w = lw - 2 * PAD, y0 = 106, hs = 20, rh = 56, top = y0 + hs + 14;
+            const day = (ms) => { const a = new Date(ms); return a.getDate() + '.' + two(a.getMonth() + 1) + '.'; };
+            const time = (ms) => { const a = new Date(ms); return a.getHours() + ':' + two(a.getMinutes()); };
+            // the one running first (it joins the log when it ends)
+            const r = d.phase === 'active' && d.run ? { t0: d.run.t0, s: d.run.s, km: d.run.km, interval: has(d.sinceKm) && has(d.run.km) ? Math.max(0, d.sinceKm - d.run.km) : null,
+                soot0: d.run.soot0, soot1: d.soot, peak: d.run.peak, result: 'running' } : null;
+            const log = (r ? [r] : []).concat(d.log), mine = log.length > 0;
+            const lp = G.panel(cv, t, LX, G.TOP, lw, 468, mine ? 'Logged by the app' : 'The engine unit\'s last five'), lb = lp.y + lp.h;
+            if (mine) {
+                const n = Math.floor((lb - 16 - top) / rh), shown = log.slice(0, n);
+                cv.text('newest first' + (log.length > n ? '  ·  ' + n + ' of ' + log.length : ''), LX + lw - PAD, G.TOP + 42, 20, t.dim, { align: 'right' });
+                // (one the app saw only by its end, the distance since the last starting again, has no duration, distance or soot before)
+                G.table(cv, t, x, y0, w, [{ label: 'Started', w: 92 }, { label: '', w: 78, align: 'right' }, { label: 'After', w: 132, align: 'right' }, { label: 'Took', w: 108, align: 'right' },
+                    { label: 'Distance', w: 120, align: 'right' }, { label: 'Soot', w: 180, align: 'right' }, { label: 'Peak', w: 108, align: 'right' }],
+                    shown.map((e) => [day(e.t0), time(e.t0), has(e.interval) ? big(Dk(e.interval)) + ' ' + dU() : '--', has(e.s) ? Math.max(1, Math.round(e.s / 60)) + ' min' : '--',
+                        has(e.km) ? num(Dk(e.km), 0) + ' ' + dU() : '--', has(e.soot0) || has(e.soot1) ? num(e.soot0, 1) + ' to ' + num(e.soot1, 1) + ' g' : '--',
+                        has(e.peak) ? Math.round(T(e.peak)) + ' ' + tU() : '--']),
+                    { rowH: rh, size: 26, headerSize: hs, middle: true });
+                // how each ended: a pill (as Service's)
+                shown.forEach((e, i) => {
+                    const run = e.result === 'running', ok = e.result === 'complete', col = ok ? GO : t.warn, py = top + i * rh + (rh - 34) / 2;
+                    cv.roundRect(x + w - 152, py, 152, 34, 6, run ? col : withAlpha(col, 0.22));
+                    cv.text(run ? 'running' : ok ? 'done' : 'stopped early', x + w - 76, py + 25, 22, run ? inkOn(t, col) : col, { align: 'center', font: 'bold' });
+                });
+            } else {
+                // nothing seen here yet: the engine unit's own last five (odometer at each, the distances between them)
+                const odo = d.odo.filter(has);
+                if (odo.length) {
+                    G.table(cv, t, x, y0, w, [{ label: 'Regeneration', w: 330 }, { label: 'At', w: 300, align: 'right' }, { label: 'After', w: 300, align: 'right' }],
+                        odo.map((km, i) => [i === 0 ? 'Last' : i === 1 ? 'The one before' : (i + 1) + ' back', big(Dk(km)) + ' ' + dU(), i + 1 < odo.length ? big(Dk(km - odo[i + 1])) + ' ' + dU() : '--']),
+                        { rowH: rh, size: 26, headerSize: hs, middle: true });
+                } else cv.text(d.why('odo1') === 'reading...' ? 'reading...' : 'none on record here: ' + d.why('odo1'), x, top + 38, 26, t.dim);
+                cv.text('Each regeneration from now on is logged with its time, soot and heat,', x, lb - 50, 22, t.dim);
+                cv.text('also with the app closed.', x, lb - G.MARGIN, 22, t.dim);
+            }
+            // ---- totals, and the soot over the last 1,000 km (the app's own log): the sawtooth of the regenerations
+            const rp = G.panel(cv, t, rx, G.TOP, rw, 468, 'Totals'), ix = rx + PAD, iw = rw - 2 * PAD, rb = rp.y + rp.h;
+            const gh = 142 + rp.h - 468, gy = rb - 14 - gh, span = MI() ? 600 : Regen.HIST_KM, pts = [];
+            // (the log's 1,000 km are 621 miles: the line starts at the chart's left edge, not before it)
+            d.hist.map((p) => [Dk(p[0]), p[1]]).forEach((p, i, all) => {
+                if (p[0] < -span) return;
+                const a = all[i - 1];
+                if (!pts.length && a && a[0] < -span && p[0] > a[0]) pts.push([-span, a[1] + (p[1] - a[1]) * (-span - a[0]) / (p[0] - a[0])]);
+                pts.push(p);
+            });
+            const yNeed = Math.max(30, Math.max.apply(null, [d.sootMax].concat(pts.map((p) => p[1]))) * 1.1), yStep = yNeed <= 30 ? 10 : yNeed <= 60 ? 20 : 50, yTop = Math.ceil(yNeed / yStep - 1e-9) * yStep;
+            const stopped = d.log.filter((e) => e.result !== 'complete').length;
+            const rows = [(y) => row(cv, t, ix, iw, y + 16, 'REGENERATIONS', big(d.regens), '', has(d.regens) ? 'successful, in the engine unit' : d.why('regens')),
+                (y) => row(cv, t, ix, iw, y + 16, 'ON AVERAGE EVERY', big(Dk(d.avgKm)), dU(), has(d.avgKm) ? 'from one to the next' : d.why('avgKm'))]
+                .concat(d.log.length ? [(y) => row(cv, t, ix, iw, y + 16, 'STOPPED EARLY', String(stopped), '', 'of the ' + d.log.length + ' logged by the app')] : []);
+            spread(G.TOP + 56, gy - 34, rows.map(() => 48)).forEach((y, i) => rows[i](y));
+            cv.text('SOOT, LAST ' + span + ' ' + dU().toUpperCase(), ix, gy - 12, 22, t.dim, { font: 'bold', spacing: 1.5 });
+            G.chart(cv, t, ix, gy, iw, gh, { xMin: -span, xMax: 0, yMin: 0, yMax: yTop, yStep, xStep: span / (MI() ? 3 : 4),
+                padLeft: 34, padRight: 22, xUnit: dU(), empty: 'logged as you drive', marks: [{ y: d.sootMax, color: t.warn }],
+                series: [{ pts, color: flow(t), fill: true }] });
+        }
+
+        /* ---------- AdBlue ---------- */
+
+        /** The AdBlue's state, from its range (BMW's own warnings: the reserve, then the last one). */
+        function adblueState(t, d) {
+            if (!has(d.adRange)) return { key: 'none', word: waiting(d, 'adRange') ? 'NO DATA YET' : 'NO RANGE VALUE', col: t.dim, how: 'off' };
+            if (d.adRange <= AD_NOW_KM) return { key: 'now', word: 'REFILL NOW', col: t.crit, how: 'fill' };
+            if (d.adRange <= AD_SOON_KM) return { key: 'soon', word: 'REFILL SOON', col: t.warn, how: 'ring' };
+            return { key: 'ok', word: 'ADBLUE OK', col: GO, how: 'tint' };
+        }
+
+        function renderAdblue(cv, t, d, now) {
+            const none = !d.demo && d.why('adRange') === 'not on this car' && d.why('noxIn') === 'not on this car';
+            if (none) return message(cv, t, 'No AdBlue system on this car', 'The engine unit has no SCR catalyst values (a B47 without AdBlue).', null, t.text);
+            const half = Math.round((G.pageBottom(cv) - G.BOTTOM) / 2), st = adblueState(t, d);
+            // ---- the level (20 l is the usual tank; a bigger one gets the longer scale)
+            const max = has(d.adLevel) && d.adLevel > 20 ? 40 : 20;
+            G.segBar(cv, t, LX, G.TOP, LW, 225 + half, { label: 'AdBlue', value: d.adLevel, unit: 'L', decimals: 1, min: 0, max, step: max / 20, scale: { every: max / 4 },
+                color: st.key === 'now' ? 'crit' : st.key === 'soon' ? 'warn' : undefined });
+            cv.text(d.adLevelEst ? 'estimated, from the engine unit\'s figure' : has(d.adLevel) ? '' : d.why('adLevel'), LX + 40 + cv.textWidth('AdBlue', 26, { font: 'bold' }), G.TOP + 42, 20, t.dim);
+            // ---- tiles: NOx before and after the SCR catalyst, how much of it the catalyst takes out, its heat
+            const ty = G.TOP + 242 + half, th = 226 - half, tw = 280, cold = has(d.scrT) && d.scrT < SCR_WARM_C;
+            tile(cv, t, LX, ty, tw, th, { label: 'NOx before the SCR', value: d.noxIn, unit: 'ppm', side: { label: 'AFTER', value: d.noxOut }, trace: trace.nox, minSpan: 100,
+                sub: has(d.noxIn) ? (traced(trace.nox) ? 'last 2 min' : 'from the engine') : d.why('noxIn') });
+            tile(cv, t, LX + 300, ty, tw, th, { label: 'NOx removed', value: d.conv, unit: '%', meter: { f: has(d.conv) ? d.conv / 100 : null, color: GO },
+                sub: has(d.conv) ? 'by the SCR catalyst, now' : cold ? 'the catalyst is still cold' : !has(d.noxIn) ? d.why('noxIn') : !has(d.noxOut) ? d.why('noxOut') : !has(d.scrT) ? d.why('scrT') : 'too little NOx to tell' });
+            tile(cv, t, LX + 600, ty, tw, th, { label: 'SCR catalyst', value: T(d.scrT), unit: tU(), color: cold ? t.cold : null, side: { label: 'BEFORE', value: T(d.tScr) }, trace: trace.scr, conv: T,
+                minSpan: F() ? 108 : 60, sub: has(d.scrT) ? (cold ? 'works from ' + Math.round(T(SCR_WARM_C)) + tU() : traced(trace.scr) ? 'last 2 min' : 'its temperature') : d.why('scrT') });
+            // ---- the card: the state, the range (what the car's own warnings go by), the averages
+            const sp = G.panel(cv, t, RX, G.TOP, RW, 468, null), x = RX + PAD, w = RW - 2 * PAD, bot = sp.y + sp.h;
+            banner(cv, t, x, G.TOP + 26, w, 60, st.word, st.col, st.how, now);
+            let top = G.TOP + 86;
+            if (st.key === 'now') { cv.text('No engine start once the range is used up', x, top + 44, 26, t.text, { font: 'bold' }); top += 52; }
+            const blocks = [{ h: 100, draw: (y) => {
+                cv.text('RANGE, ABOUT', x, y + 16, 22, t.dim, { font: 'bold', spacing: 1.5 });
+                const vw = cv.text(big(Dk(d.adRange)), x, y + 92, 76, !has(d.adRange) ? t.dim : st.key === 'ok' ? t.text : st.col, { font: 'num' });
+                cv.text(dU(), x + vw + 10, y + 92, 30, t.dim);
+                if (!has(d.adRange)) cv.text(d.why('adRange'), x + w, y + 90, 22, t.dim, { align: 'right' });
+            } }, { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'NOX REMOVED, AVERAGE', num(d.scrEff, 1), '%', has(d.scrEff) ? 'as the engine unit keeps it' : d.why('scrEff')) },
+            { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'ADBLUE QUALITY', num(d.adQual, 1), '%', has(d.adQual) ? 'urea in it: 32.5 % as sold' : d.why('adQual')) }];
+            const ys = spread(top, bot - G.MARGIN + 6, blocks.map((b) => b.h));
+            blocks.forEach((b, i) => b.draw(ys[i]));
+        }
+
+        /* ---------- Engine ---------- */
+
+        /**
+         * An EGR valve in its pipe, from the side: the exhaust gas comes from the left; the plate across the pipe holds it
+         * back (closed) or, turned, lets a stream through that is as thick as the valve is open. open = 0..1, null: not known.
+         */
+        function valve(cv, t, x, y, w, h, open, col) {
+            const known = has(open), f = known ? G.clamp(open, 0, 1) : 0, cx = x + w / 2, cy = y + h / 2, R = h / 2 - 9, lit = withAlpha(col, 0.95);
+            const arrow = (px, s) => { const k = Math.min(s - 3, 9); if (k >= 3) { cv.line(px - k * 0.75, cy - k, px, cy, 3, lit); cv.line(px, cy, px - k * 0.75, cy + k, 3, lit); } };
+            cv.fillRect(x, cy - R, w, 2 * R, t.track);
+            if (known) {
+                cv.fillRect(x, cy - R, cx - x, 2 * R, withAlpha(col, f > 0 ? 0.3 : 0.14));           // the gas up to the plate
+                if (f > 0) {
+                    const s = Math.max(2, R * f);
+                    cv.fillRect(cx, cy - s, x + w - cx, 2 * s, withAlpha(col, 0.3));                // what gets past it
+                    [0.3, 0.64].forEach((k) => arrow(x + (cx - x) * k, R));
+                    [0.4, 0.74].forEach((k) => arrow(cx + (x + w - cx) * k, s));
+                }
+            }
+            cv.fillRect(x, cy - R - 4, w, 4, t.tick); cv.fillRect(x, cy + R, w, 4, t.tick);          // the pipe
+            cv.arc(cx, cy, R + 5, R + 9, 0, 360, t.tick);                                             // the valve's body
+            const a = f * 80 * Math.PI / 180, dx = Math.sin(a) * (R - 2), dy = Math.cos(a) * (R - 2), pc = known ? t.text : t.tick;
+            cv.line(cx - dx, cy + dy, cx + dx, cy - dy, 7, pc);                                       // the plate
+            cv.circle(cx, cy, 5.5, t.bg); cv.circle(cx, cy, 2.5, pc);
+        }
+
+        /** One EGR valve in its column (ys: the tops of its pill, picture and row): OPEN / CLOSED, the opening, the target. */
+        function egr(cv, t, x, w, ys, label, v) {
+            const known = has(v.pos), open = known && v.pos >= EGR_OPEN, absent = !known && v.why === 'not on this car';
+            cv.text(label, x, ys[0] + 16, 22, t.dim, { font: 'bold', spacing: 1.5 });
+            banner(cv, t, x, ys[0] + 30, w, 60, known ? (open ? 'OPEN' : 'CLOSED') : absent ? 'NOT FITTED' : '--', flow(t), open ? 'fill' : known ? 'plain' : 'off');
+            valve(cv, t, x, ys[1], w, 68, known ? Math.max(0, v.pos) / 100 : null, flow(t));
+            if (known) row(cv, t, x, w, ys[2] + 16, 'OPENING', String(Math.round(Math.max(0, v.pos))), '%', has(v.target) ? 'target ' + Math.round(Math.max(0, v.target)) + ' %' : '');
+            else cv.text(absent ? 'this engine has none' : fitText(cv, v.why, 22, w), x, ys[2] + 30, 22, t.dim);
+        }
+
+        /** A bar (G.bar) with its target: a tick over the bar where the value should be, the number beside the label. */
+        function targetBar(cv, t, x, y, w, g) {
+            G.bar(cv, t, x, y, w, 96, g);
+            if (!has(g.target)) return;
+            cv.text('target ' + G.fmt(g.target, g.decimals), x + 20 + cv.textWidth(g.label.toUpperCase(), 22, { font: 'bold', spacing: 2 }), y + 26, 20, t.dim);
+            cv.fillRect(x + G.clamp(g.target / g.max, 0, 1) * (w - 18) + 16, y + 33, 4, 9, t.text);
+        }
+
+        /**
+         * The injectors' quantity corrections: a cell a cylinder (as M Vitals' misfires), in the cylinders' order (cyl: the
+         * cylinder of each of inj), the bar from the middle (right = more fuel).
+         */
+        function injectors(cv, t, x, y, w, h, inj, cyl) {
+            const n = inj.length, gap = 8, cw = (w - gap * (n - 1)) / n;
+            inj.map((q, i) => ({ q, cyl: cyl[i] })).sort((a, b) => a.cyl - b.cyl).forEach((c, i) => {
+                const q = c.q, cx = x + i * (cw + gap), mid = cx + cw / 2, ok = has(q), hit = ok && Math.abs(q) > INJ_WARN, by = y + h - 20;
+                cv.roundRect(cx, y, cw, h, 8, withAlpha(hit ? t.warn : t.track, hit ? 0.18 : 0.9));
+                cv.text((cw > 84 ? 'Cyl ' : '') + c.cyl, mid, y + 28, 22, t.dim, { align: 'center', font: 'bold' });
+                cv.text(ok ? (q > 0 ? '+' : '') + q.toFixed(1) : '--', mid, by - 12, cw > 84 ? 34 : 28, !ok ? t.dim : hit ? t.warn : t.text, { align: 'center', font: 'num' });
+                cv.roundRect(cx + 12, by, cw - 24, 6, 3, withAlpha(t.tick, 0.55));
+                if (ok) { const len = Math.max(3, G.clamp(Math.abs(q) / INJ_FULL, 0, 1) * (cw - 24) / 2); cv.roundRect(q > 0 ? mid : mid - len, by, len, 6, 3, hit ? t.warn : flow(t)); }
+                cv.fillRect(mid - 1, by - 3, 2, 12, t.text);
             });
         }
 
-        /** Every value with its identifier and the reply's bytes, 2 x 10 a page (the pages turn: tap, or every 8 s). */
+        function renderEngine(cv, t, d) {
+            // ---- the EGR valves, a column each; under them what they are there for
+            const p = G.panel(cv, t, LX, G.TOP, LW, 468, 'EGR valves'), pb = p.y + p.h, cw = 400, x1 = LX + PAD, x2 = LX + LW - PAD - cw;
+            const shut = (v) => has(v.pos) ? v.pos < EGR_OPEN : v.why === 'not on this car';
+            if (d.phase === 'active' && has(d.egrHp.pos) && shut(d.egrHp) && shut(d.egrLp)) cv.text('closed while the filter regenerates', LX + LW - PAD, G.TOP + 42, 20, t.dim, { align: 'right' });
+            const ys = spread(G.TOP + 52, pb - G.MARGIN + 6, [90, 68, 48, 1, 48]);
+            egr(cv, t, x1, cw, ys, 'HIGH PRESSURE', d.egrHp);
+            egr(cv, t, x2, cw, ys, 'LOW PRESSURE', d.egrLp);
+            cv.fillRect(x1, ys[3], LW - 2 * PAD, 1, withAlpha(t.tick, 0.6));
+            row(cv, t, x1, cw, ys[4] + 16, 'EGR RATE', num(d.egrRate, 0), '%', has(d.egrRate) ? 'exhaust gas in the intake air' : d.why('egrRate'));
+            row(cv, t, x2, cw, ys[4] + 16, 'AIR MASS', num(d.air, 0), 'mg/stroke', has(d.air) ? (has(d.airTarget) ? 'target ' + Math.round(d.airTarget) : '') : d.why('air'));
+            // ---- fuel and boost against their targets, the injectors
+            const q = G.panel(cv, t, RX, G.TOP, RW, 468, 'Fuel and boost'), x = RX + PAD, w = RW - 2 * PAD, qb = q.y + q.h, ih = 96 + Math.round((q.h - 468) / 2);
+            const bs = spread(G.TOP + 46, qb - G.MARGIN + 10, [96, 96, 36 + ih]);
+            const over = (a, b, lim) => (has(a) && a > lim) || (has(b) && b > lim);            // (a longer scale for the few engines past the usual one)
+            targetBar(cv, t, x, bs[0], w, { label: 'Rail pressure', value: d.rail, unit: 'bar', max: over(d.rail, d.railTarget, 2500) ? 3000 : 2500, step: 500, decimals: 0, target: d.railTarget });
+            targetBar(cv, t, x, bs[1], w, { label: 'Boost', value: d.boost, unit: 'bar', max: over(d.boost, d.boostTarget, 3) ? 4 : 3, step: 0.5, decimals: 2, target: d.boostTarget });
+            cv.text('INJECTOR CORRECTION', x, bs[2] + 18, 22, t.dim, { font: 'bold', spacing: 1.5 });
+            cv.text('mg/stroke, at warm idle', x + 14 + cv.textWidth('INJECTOR CORRECTION', 22, { font: 'bold', spacing: 1.5 }), bs[2] + 18, 20, t.dim);
+            injectors(cv, t, x, bs[2] + 36, w, ih, d.inj, d.injCyl);
+        }
+
+        /* ---------- Details ---------- */
+
+        /** Every value with its identifier and the reply's bytes, in two columns (the pages turn: Prev / Next, or every 8 s). */
         function renderDetails(cv, t, d) {
-            const s = src(), rows = s.rows(), per = 20, pages = Math.max(1, Math.ceil(rows.length / per));
+            const s = src(), rows = s.rows(), y0 = 118, pitch = 37;
+            const per = 2 * (Math.floor((G.pageBottom(cv) - G.MARGIN - y0) / pitch) + 1), pages = Math.max(1, Math.ceil(rows.length / per));
             if (!cv.own && Date.now() - detailT > 8000) { detail = (detail + 1) % pages; detailT = Date.now(); }
             detail = Math.min(detail, pages - 1);
-            const p = G.panel(cv, t, 24, G.TOP, 1552, 468, 'Details' + (pages > 1 ? '  ' + (detail + 1) + '/' + pages : ''));
+            const title = 'Details' + (pages > 1 ? '  ' + (detail + 1) + '/' + pages : ''), p = G.panel(cv, t, LX, G.TOP, W - 2 * LX, 468, title);
             const id = d.demo ? 'demo' : d.index ? 'engine unit ' + d.index + ' · ' + (d.family === 'other' ? 'not a diesel' : D.NAMES[d.family] || '?') + (d.verified ? '' : ' · unverified') : 'engine unit: not identified yet';
             const scr = d.scrIndex ? '  ·  AdBlue unit ' + d.scrIndex + (d.scr ? ' (' + d.scr.toUpperCase() + ')' : '') : '';
-            cv.text(id + scr, 1552, p.y + 42, 20, t.dim, { align: 'right', literal: true });
-            if (!rows.length) { cv.text('Nothing read yet', 48, 140, 26, t.dim); return; }
+            // (left of the page's buttons where the kit draws them)
+            const paged = cv.own && pages > 1, ir = paged ? 1312 : W - LX - PAD, tw = cv.textWidth(title, 26, { font: 'bold' });
+            cv.text(fitText(cv, id + scr, 20, ir - (LX + 18 + tw + 24), { literal: true }), ir, p.y + 42, 20, t.dim, { align: 'right', literal: true });
+            if (!rows.length) { cv.text('Nothing read yet', LX + PAD, 140, 26, t.dim); return; }
             rows.slice(detail * per, detail * per + per).forEach((r, i) => {
-                const x = 48 + (i >= 10 ? 764 : 0), y = 118 + (i % 10) * 37;
-                const has = r.value !== null, n = r.value;
-                const val = has ? (Math.abs(n) >= 1000 ? thousands(n) : Number.isInteger(n) ? String(n) : n.toFixed(Math.abs(n) < 10 ? 2 : 1)) + (r.unit ? ' ' + r.unit : '') : r.why;
-                cv.text(LABELS[r.key] || r.key, x, y, 20, t.text);
-                cv.text((r.ecu === D.SCR ? '0B ' : '') + r.did, x + 300, y, 18, t.dim, { literal: true });
-                cv.text(val, x + 520, y, 20, has ? t.text : t.dim, { align: 'right', literal: has });
-                cv.text(r.bytes, x + 536, y, 16, t.dim, { literal: true });
+                const x = LX + PAD + (i >= per / 2 ? 764 : 0), y = y0 + (i % (per / 2)) * pitch, n = r.value, ok = n !== null;
+                cv.text(LABELS[r.key] || r.key, x, y, 22, t.text);
+                cv.text((r.ecu === D.SCR ? '0B ' : '') + r.did, x + 290, y, 18, t.dim, { literal: true });
+                if (ok) {
+                    cv.text((Math.abs(n) >= 1000 ? thousands(n) : Number.isInteger(n) ? String(n) : n.toFixed(Math.abs(n) < 10 ? 2 : 1)) + (r.unit ? ' ' + (r.unit === 'l' ? 'L' : r.unit) : ''),
+                        x + 530, y, 22, t.text, { align: 'right', literal: true });
+                } else {
+                    // why there is none: under the values where it is short, else from the identifier on (over the bytes' room)
+                    const long = cv.textWidth(r.why, 22) > 150;
+                    cv.text(fitText(cv, r.why, 22, 360), long ? x + 372 : x + 530, y, 22, t.dim, { align: long ? 'left' : 'right' });
+                }
+                if (r.bytes) cv.text(fitText(cv, r.bytes, 18, 190, { literal: true }), x + 546, y, 18, t.dim, { literal: true });
             });
             if (pages > 1) {
                 G.button(cv, t, 1336, p.y + 12, 104, 40, 'Prev', () => { detail = (detail + pages - 1) % pages; return render(); }, { key: 'dprev' });
@@ -408,12 +678,15 @@ mgu.run({
             const cv = ctx.canvas(W, H).clear(t.bg);
             if (!d.demo && d.family === 'other') message(cv, t, 'Not a diesel engine unit', 'This car\'s engine unit (SGBD index ' + d.index + ') is not a diesel one (DDE).', 'The app reads B47 / B57 diesels only.');
             else if (!d.demo && page !== 4 && (d.status === 'NO LINK' || (!d.family && d.status !== 'IDENTIFYING'))) {
-                message(cv, t, d.status === 'NO LINK' ? 'No diagnostic link' : d.status === 'PARKED' ? 'The car is parked and locked' : 'The engine unit doesn\'t answer',
-                    d.status === 'NO LINK' ? 'The head unit\'s diagnostic service isn\'t there yet.' : 'Switch the ignition on or start the engine.');
+                const parked = d.status === 'PARKED';
+                message(cv, t, d.status === 'NO LINK' ? 'No diagnostic link' : parked ? 'The car is parked and locked' : 'The engine unit doesn\'t answer',
+                    d.status === 'NO LINK' ? 'The head unit\'s diagnostic service isn\'t there yet.' : 'Switch the ignition on or start the engine.', null, parked ? t.text : null);
             } else [renderDpf, renderRegens, renderAdblue, renderEngine, renderDetails][page](cv, t, d, now);
             const state = d.demo ? 'DEMO' : d.status;
+            // (REGEN, not the whole word: with it and the state's badge the header still has room for the app's name, so the
+            // tabs stay where they are when a regeneration starts or the page turns)
             G.frame(cv, t, TABS, page, [
-                d.phase === 'active' && page !== 0 && { text: 'REGENERATING', color: t.warn },
+                d.phase === 'active' && page !== 0 && { text: 'REGEN', color: t.warn },
                 d.diesel && !d.verified && !d.demo && { text: 'UNVERIFIED', color: t.warn },
                 { text: state, color: state === 'LIVE' ? BLUE : t.warn },
             ]);
