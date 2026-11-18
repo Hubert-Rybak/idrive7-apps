@@ -24,6 +24,8 @@ const mgu = require('./kit/mgu');
 const { withAlpha, rgba } = require('./kit/canvas');
 const G = require('./kit/gauges');
 const { fitText } = require('./kit/text-layout');
+// (a word between numbers: translated before they are added, the drawn line's own translation leaves numbers alone)
+const { t: tr } = require('./kit/i18n');
 const Car = require('./kit/car');
 const Engine = require('./kit/engine');
 const { Reader } = require('./reader');
@@ -360,7 +362,7 @@ mgu.run({
                 zones: lim ? [{ from: Math.round(lim * 0.9 / step) * step, to: max, color: 'warn' }] : [], marks: lim ? [{ value: lim, color: t.warn }] : [],
             });
             // beside the title: the soot's two sources (the big number is what the engine unit regenerates by)
-            const note = has(d.soot) ? [has(d.sootMeas) && 'measured ' + d.sootMeas.toFixed(1) + ' g', has(d.sootSim) && 'model ' + d.sootSim.toFixed(1) + ' g'].filter(Boolean).join('  ·  ') : d.why('soot');
+            const note = has(d.soot) ? [has(d.sootMeas) && 'measured ' + d.sootMeas.toFixed(1) + ' g', has(d.sootSim) && 'soot model ' + d.sootSim.toFixed(1) + ' g'].filter(Boolean).join('  ·  ') : d.why('soot');
             cv.text(note, x + 40 + cv.textWidth('Soot', 26, { font: 'bold' }), y + 42, 20, t.dim);
             if (!lim) return;
             // the mark's name, at it (G.segBar's bar: from x + 24, w - 66 long, its top edge 18 further right, 80 under the top)
@@ -407,7 +409,7 @@ mgu.run({
             const since = { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'SINCE LAST REGENERATION', big(Dk(d.sinceKm)), dU(),
                 has(d.sinceKm) ? (has(d.sinceS) ? hm(d.sinceS) + ' of driving' : '') : d.why('sinceKm')) };
             const next = { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'NEXT ONE IN ABOUT', big(Dk(d.nextKm)), dU(),
-                has(d.nextKm) ? (d.nextKm > 0 ? 'by' : 'past') + ' the average of ' + big(Dk(d.avgKm)) + ' ' + dU() + ' between them' : has(d.sinceKm) ? d.why('avgKm') : '') };
+                has(d.nextKm) ? (d.nextKm > 0 ? 'average interval ' : 'past the average interval of ') + big(Dk(d.avgKm)) + ' ' + dU() : has(d.sinceKm) ? d.why('avgKm') : '') };
             let blocks = [load, since, next];
             if (st.key === 'active') {
                 const r = d.run || {};
@@ -456,10 +458,10 @@ mgu.run({
                 const n = Math.floor((lb - 16 - top) / rh), shown = log.slice(0, n);
                 cv.text('newest first' + (log.length > n ? '  ·  ' + n + ' of ' + log.length : ''), LX + lw - PAD, G.TOP + 42, 20, t.dim, { align: 'right' });
                 // (one the app saw only by its end, the distance since the last starting again, has no duration, distance or soot before)
-                G.table(cv, t, x, y0, w, [{ label: 'Started', w: 92 }, { label: '', w: 78, align: 'right' }, { label: 'After', w: 132, align: 'right' }, { label: 'Took', w: 108, align: 'right' },
+                G.table(cv, t, x, y0, w, [{ label: 'Started', w: 92 }, { label: '', w: 78, align: 'right' }, { label: 'Interval', w: 132, align: 'right' }, { label: 'Took', w: 108, align: 'right' },
                     { label: 'Distance', w: 120, align: 'right' }, { label: 'Soot', w: 180, align: 'right' }, { label: 'Peak', w: 108, align: 'right' }],
                     shown.map((e) => [day(e.t0), time(e.t0), has(e.interval) ? big(Dk(e.interval)) + ' ' + dU() : '--', has(e.s) ? Math.max(1, Math.round(e.s / 60)) + ' min' : '--',
-                        has(e.km) ? num(Dk(e.km), 0) + ' ' + dU() : '--', has(e.soot0) || has(e.soot1) ? num(e.soot0, 1) + ' to ' + num(e.soot1, 1) + ' g' : '--',
+                        has(e.km) ? num(Dk(e.km), 0) + ' ' + dU() : '--', has(e.soot0) || has(e.soot1) ? num(e.soot0, 1) + ' ' + tr('to') + ' ' + num(e.soot1, 1) + ' g' : '--',
                         has(e.peak) ? Math.round(T(e.peak)) + tU() : '--']),
                     { rowH: rh, size: 26, headerSize: hs, middle: true });
                 // how each ended: a pill (as Service's)
@@ -472,7 +474,7 @@ mgu.run({
                 // nothing seen here yet: the engine unit's own last five (odometer at each, the distances between them)
                 const odo = d.odo.filter(has);
                 if (odo.length) {
-                    G.table(cv, t, x, y0, w, [{ label: 'Regeneration', w: 330 }, { label: 'At', w: 300, align: 'right' }, { label: 'After', w: 300, align: 'right' }],
+                    G.table(cv, t, x, y0, w, [{ label: 'Regeneration', w: 330 }, { label: 'At', w: 300, align: 'right' }, { label: 'Interval', w: 300, align: 'right' }],
                         odo.map((km, i) => [i === 0 ? 'Last' : i === 1 ? 'The one before' : (i + 1) + ' back', big(Dk(km)) + ' ' + dU(), i + 1 < odo.length ? big(Dk(km - odo[i + 1])) + ' ' + dU() : '--']),
                         { rowH: rh, size: 26, headerSize: hs, middle: true });
                 } else cv.text(d.why('odo1') === 'reading...' ? 'reading...' : 'none on record here: ' + d.why('odo1'), x, top + 38, 26, t.dim);
@@ -493,7 +495,7 @@ mgu.run({
             const stopped = d.log.filter((e) => e.result !== 'complete').length;
             const rows = [(y) => row(cv, t, ix, iw, y + 16, 'REGENERATIONS', big(d.regens), '', has(d.regens) ? 'successful, in the engine unit' : d.why('regens')),
                 (y) => row(cv, t, ix, iw, y + 16, 'ON AVERAGE EVERY', big(Dk(d.avgKm)), dU(), has(d.avgKm) ? 'from one to the next' : d.why('avgKm'))]
-                .concat(d.log.length ? [(y) => row(cv, t, ix, iw, y + 16, 'STOPPED EARLY', String(stopped), '', 'of the ' + d.log.length + ' logged by the app')] : []);
+                .concat(d.log.length ? [(y) => row(cv, t, ix, iw, y + 16, 'STOPPED EARLY', String(stopped), '', 'logged by the app: ' + d.log.length)] : []);
             spread(G.TOP + 56, gy - 34, rows.map(() => 48)).forEach((y, i) => rows[i](y));
             cv.text('SOOT, LAST ' + span + ' ' + dU().toUpperCase(), ix, gy - 12, 22, t.dim, { font: 'bold', spacing: 1.5 });
             G.chart(cv, t, ix, gy, iw, gh, { xMin: -span, xMax: 0, yMin: 0, yMax: yTop, yStep, xStep: span / (MI() ? 3 : 4),
@@ -522,11 +524,11 @@ mgu.run({
             cv.text(d.adLevelEst ? 'estimated, from the engine unit\'s figure' : has(d.adLevel) ? '' : d.why('adLevel'), LX + 40 + cv.textWidth('AdBlue', 26, { font: 'bold' }), G.TOP + 42, 20, t.dim);
             // ---- tiles: NOx before and after the SCR catalyst, how much of it the catalyst takes out, its heat
             const ty = G.TOP + 242 + half, th = 226 - half, tw = 280, cold = has(d.scrT) && d.scrT < SCR_WARM_C;
-            tile(cv, t, LX, ty, tw, th, { label: 'NOx before the SCR', value: d.noxIn, unit: 'ppm', side: { label: 'AFTER', value: d.noxOut }, trace: trace.nox, minSpan: 100,
-                sub: has(d.noxIn) ? (traced(trace.nox) ? 'last 2 min' : 'from the engine') : d.why('noxIn') });
+            tile(cv, t, LX, ty, tw, th, { label: 'NOx before the SCR', value: d.noxIn, unit: 'ppm', side: { label: 'AFTER SCR', value: d.noxOut }, trace: trace.nox, minSpan: 100,
+                sub: has(d.noxIn) ? (traced(trace.nox) ? 'last 2 min' : 'engine out') : d.why('noxIn') });
             tile(cv, t, LX + 300, ty, tw, th, { label: 'NOx removed', value: d.conv, unit: '%', meter: { f: has(d.conv) ? d.conv / 100 : null, color: GO },
                 sub: has(d.conv) ? 'by the SCR catalyst, now' : cold ? 'the catalyst is still cold' : !has(d.noxIn) ? d.why('noxIn') : !has(d.noxOut) ? d.why('noxOut') : !has(d.scrT) ? d.why('scrT') : 'too little NOx to tell' });
-            tile(cv, t, LX + 600, ty, tw, th, { label: 'SCR catalyst', value: T(d.scrT), unit: tU(), color: cold ? t.cold : null, side: { label: 'BEFORE', value: T(d.tScr) }, trace: trace.scr, conv: T,
+            tile(cv, t, LX + 600, ty, tw, th, { label: 'SCR catalyst', value: T(d.scrT), unit: tU(), color: cold ? t.cold : null, side: { label: 'BEFORE SCR', value: T(d.tScr) }, trace: trace.scr, conv: T,
                 minSpan: F() ? 108 : 60, sub: has(d.scrT) ? (cold ? 'works from ' + Math.round(T(SCR_WARM_C)) + tU() : traced(trace.scr) ? 'last 2 min' : 'its temperature') : d.why('scrT') });
             // ---- the card: the state, the range (what the car's own warnings go by), the averages
             const sp = G.panel(cv, t, RX, G.TOP, RW, 468, null), x = RX + PAD, w = RW - 2 * PAD, bot = sp.y + sp.h;
@@ -576,7 +578,7 @@ mgu.run({
             cv.text(label, x, ys[0] + 16, 22, t.dim, { font: 'bold', spacing: 1.5 });
             banner(cv, t, x, ys[0] + 30, w, 60, known ? (open ? 'OPEN' : 'CLOSED') : absent ? 'NOT FITTED' : '--', flow(t), open ? 'fill' : known ? 'plain' : 'off');
             valve(cv, t, x, ys[1], w, 68, known ? Math.max(0, v.pos) / 100 : null, flow(t));
-            if (known) row(cv, t, x, w, ys[2] + 16, 'OPENING', String(Math.round(Math.max(0, v.pos))), '%', has(v.target) ? 'target ' + Math.round(Math.max(0, v.target)) + ' %' : '');
+            if (known) row(cv, t, x, w, ys[2] + 16, 'VALVE OPENING', String(Math.round(Math.max(0, v.pos))), '%', has(v.target) ? 'target ' + Math.round(Math.max(0, v.target)) + ' %' : '');
             else cv.text(absent ? 'this engine has none' : fitText(cv, v.why, 22, w), x, ys[2] + 30, 22, t.dim);
         }
 
@@ -674,7 +676,7 @@ mgu.run({
             } else [renderDpf, renderRegens, renderAdblue, renderEngine, renderDetails][page](cv, t, d, now);
             // the state's badge: an unverified engine unit's LIVE says UNVERIFIED instead (two badges at most: with REGEN, not
             // the whole word, the header still has room for the app's name, so the tabs stay where they are)
-            const state = d.demo ? 'DEMO' : d.status === 'LIVE' && d.diesel && !d.verified ? 'UNVERIFIED' : d.status;
+            const state = d.demo ? 'DEMO' : d.status === 'LIVE' && d.diesel && !d.verified ? 'UNVERIFIED' : d.status === 'PARKED' ? 'CAR PARKED' : d.status;
             G.frame(cv, t, TABS, page, [
                 d.phase === 'active' && page !== 0 && { text: 'REGEN', color: t.warn },
                 { text: state, color: state === 'LIVE' ? BLUE : t.warn },
