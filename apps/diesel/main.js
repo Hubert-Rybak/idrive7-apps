@@ -25,9 +25,13 @@ function demo(now) {
         demo: true, soot: 9.6 + Math.sin(s) * 0.1, sootModel: 10.4, sootMax: 24, ash: 38, ashMax: 150, dp: 21, tIn: 612 + Math.sin(s / 3) * 6, tOut: 648, tHist: hist.map((p, i) => 300 + (i > 85 ? (i - 85) * 22 : 0)),
         dpHist: hist.map((p) => 8 + p[1] * 0.5), state: 'regen', progress: 0.62, regenMin: 11, regenKm: 13, startSoot: 24.6,
         sinceKm: 0, lastKm: 438, lastMin: 19, count: 287, avgKm: 441, hist,
+        egrHp: { pos: 0, target: 0 }, egrLp: { pos: 0, target: 0 }, egrRate: 0, air: 520, airTarget: 520,
+        rail: 1420, railTarget: 1450, boost: 1.62, boostTarget: 1.65, inj: [0.4, -0.3, 0.6, -0.2],
     } : {
         demo: true, soot: 16.4 + Math.sin(s) * 0.1, sootModel: 17.1, sootMax: 24, ash: 38, ashMax: 150, dp: 14 + Math.sin(s / 2), tIn: 318 + Math.sin(s / 3) * 6, tOut: 296, tHist: hist.map((p, i) => 280 + 40 * Math.sin(i / 6)),
         dpHist: hist.map((p) => 8 + p[1] * 0.5), state: 'normal', sinceKm: 312, sinceMin: 274, lastKm: 438, lastMin: 19, count: 287, avgKm: 441, hist,
+        egrHp: { pos: 34 + Math.sin(s / 2) * 2, target: 36 }, egrLp: { pos: 0, target: 0 }, egrRate: 18, air: 412, airTarget: 430,
+        rail: 1180, railTarget: 1200, boost: 1.45, boostTarget: 1.48, inj: [0.4, -0.3, 1.2, -0.6],
     };
 }
 
@@ -118,10 +122,66 @@ mgu.run({
             cv.text('dosing 1.9 ml/min', 1252, 470, 24, t.dim, { align: 'center' });
         }
 
+        /**
+         * An EGR valve seen along the flow: the pipe, its butterfly plate turning on a horizontal shaft (closed = the
+         * plate fills the pipe, fully open = edge on), the gas let through glowing around it. open = 0..1 or null.
+         */
+        function valve(cv, t, cx, cy, r, open, col) {
+            const known = G.isNum(open), f = known ? G.clamp(open, 0, 1) : 0;
+            // the ring: how far open, 0..100 %
+            cv.arc(cx, cy, r + 4, r + 16, 0, 360, t.track);
+            if (known && f > 0.005) cv.arc(cx, cy, r + 4, r + 16, 0, f * 360, col, { round: true });
+            cv.circle(cx, cy, r, withAlpha('#000000', 0.35));
+            if (known && f > 0.02) cv.circle(cx, cy, r, withAlpha(col, 0.2 + 0.3 * f));
+            // the plate: an ellipse as horizontal strips (quads), as high as the valve is closed (edge on when fully open)
+            const rx = r - 3, ry = Math.max(3, rx * (1 - f)), N = 24, pc = known ? withAlpha('#c9d0da', 0.9) : withAlpha(t.tick, 0.5);
+            const half = (y) => rx * Math.sqrt(Math.max(0, 1 - (y / ry) * (y / ry)));
+            for (let k = 0; k < N; k++) {
+                const y0 = -ry + 2 * ry * k / N, y1 = -ry + 2 * ry * (k + 1) / N, w0 = half(y0), w1 = half(y1);
+                cv.quad([[cx - w0, cy + y0], [cx + w0, cy + y0], [cx + w1, cy + y1], [cx - w1, cy + y1]], pc);
+            }
+            cv.line(cx - r - 26, cy, cx + r + 26, cy, 5, t.tick);
+            cv.circle(cx, cy, 7, t.dim);
+        }
+
+        /** One EGR valve with its state: OPEN / CLOSED, the opening and the engine unit's target. */
+        function egr(cv, t, cx, label, v) {
+            const has = v && G.isNum(v.pos), open = has && v.pos >= 3, col = open ? (t.accent2 || t.accent) : t.dim;
+            cv.text(label, cx, 104, 22, t.dim, { align: 'center', font: 'bold', spacing: 1.5 });
+            valve(cv, t, cx, 228, 92, has ? v.pos / 100 : null, col);
+            cv.text(has ? (open ? 'OPEN' : 'CLOSED') : 'NOT FITTED', cx, 396, 40, has ? (open ? t.text : t.dim) : t.dim, { align: 'center', font: 'bold', spacing: 3 });
+            if (has) {
+                const vw = cv.text(String(Math.round(v.pos)), cx - 10, 452, 44, t.text, { align: 'right', font: 'num' });
+                cv.text('%', cx - 4, 452, 24, t.dim);
+                cv.text('target ' + Math.round(v.target) + ' %', cx + 40, 450, 22, t.dim);
+            }
+        }
+
+        function renderEngine(cv, t, d) {
+            const p = G.panel(cv, t, 24, G.TOP, 880, 468, 'EGR');
+            egr(cv, t, 244, 'HIGH PRESSURE', d.egrHp);
+            egr(cv, t, 684, 'LOW PRESSURE', d.egrLp);
+            cv.text('exhaust gas let back in  ' + d.egrRate + ' %  ·  air mass ' + d.air + ' of ' + d.airTarget + ' mg/stroke', 464, p.y + p.h - 22, 20, t.dim, { align: 'center' });
+            G.panel(cv, t, 928, G.TOP, 648, 468, 'Engine');
+            G.bar(cv, t, 952, 92, 600, 96, { label: 'Rail pressure', value: d.rail, unit: 'bar', max: 2500, step: 500, peak: d.railTarget, text: String(d.rail) });
+            G.bar(cv, t, 952, 200, 600, 96, { label: 'Boost', value: d.boost, unit: 'bar', decimals: 2, max: 3, step: 0.5, peak: d.boostTarget });
+            cv.text('INJECTOR CORRECTION', 952, 340, 22, t.dim, { font: 'bold', spacing: 1.5 });
+            const iw = cv.textWidth('INJECTOR CORRECTION', 22, { font: 'bold', spacing: 1.5 });
+            cv.text('mg/stroke', 952 + iw + 14, 340, 20, t.dim);
+            const zy = 400, n = d.inj.length, cw = 600 / n;
+            cv.fillRect(952, zy, 600, 2, t.tick);
+            d.inj.forEach((q, i) => {
+                const x = 952 + i * cw + cw / 2, hgt = G.clamp(q / 1.5, -1, 1) * 34, c = Math.abs(q) > 1 ? t.warn : t.accent2 || t.accent;
+                cv.fillRect(x - 22, hgt > 0 ? zy - hgt : zy + 2, 44, Math.max(2, Math.abs(hgt)), c);
+                cv.text((q > 0 ? '+' : '') + q.toFixed(1), x, 466, 24, Math.abs(q) > 1 ? t.warn : t.text, { align: 'center', font: 'bold' });
+                cv.text('cyl ' + (i + 1), x, 494, 18, t.dim, { align: 'center' });
+            });
+        }
+
         function render() {
             const t = ctx.theme(), now = Date.now(), d = demo(now);
             const cv = ctx.canvas(W, H).clear(t.bg);
-            [() => renderDpf(cv, t, d, now), () => renderRegens(cv, t), () => renderAdblue(cv, t), () => null][page]();
+            [() => renderDpf(cv, t, d, now), () => renderRegens(cv, t), () => renderAdblue(cv, t), () => renderEngine(cv, t, d)][page]();
             G.frame(cv, t, TABS, page, [d.demo && { text: 'DEMO' }]);
             return ui.image('MAIN_GFX', cv);
         }
