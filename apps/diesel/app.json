@@ -31,7 +31,6 @@
       "buttons": [["BTN_PAGE", "Next page"], ["BTN_PREV", "Previous page"], ["BTN_SETTINGS", "Settings"]] }
   ],
   "settings": [
-    {"key": "regenFlash", "label": "Flash the ambient light at a regeneration", "type": "bool", "default": false},
     {"key": "distUnit", "label": "Distance unit", "type": "choice", "default": "km",
      "options": [["km", "km"], ["mi", "miles"]]},
     {"key": "tempUnit", "label": "Temperature unit", "type": "choice", "default": "c",

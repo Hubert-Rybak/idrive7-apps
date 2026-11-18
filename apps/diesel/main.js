@@ -16,10 +16,9 @@
  *   Details        every value with its identifier, the reply's bytes and why one has none: what the car really sends
  *
  * In the background (app.json autostart; regen.js): while the engine runs, the filter's values every 20 s (5 s during a
- * regeneration), so each regeneration is logged even with the app closed; nothing once the car is locked and left.
- * Optional: the ambient light flashes when a regeneration starts and ends (setting regenFlash, Ambient config's flash).
+ * regeneration and until it is told done or stopped), so each regeneration is logged even with the app closed; nothing
+ * once the car is locked and left.
  */
-const fs = require('fs');
 const path = require('path');
 const mgu = require('./kit/mgu');
 const { withAlpha, rgba } = require('./kit/canvas');
@@ -48,8 +47,6 @@ const PAGE_MS = [2000, 5000, 2000, 1000, 2000];
 // what the background follows while the engine runs: enough to see a regeneration start and end
 const BG_KEYS = ['soot', 'tDpf', 'tDpfSens', 'sinceKm', 'pid8b', 'rgnNum', 'loadPct', 'avgKm', 'avgStart', 'avgEnd', 'regens'];
 const BG_MS = 20000, BG_REGEN_MS = 5000, RUN_RPM = 400, TICK_MS = 1000;
-const AMBIENT_FLASH = process.env.MGU_AMBIENT_FLASH || '/dev/shm/mgu-ambient-flash.json';
-const FLASH = { start: [255, 140, 0], complete: [0, 230, 90], stopped: [255, 40, 40] };
 const KM_MI = 0.621371;
 const AD_DENSITY = 1090;              // g per litre of AdBlue (32.5 % urea)
 const SCR_WARM_C = 180;               // deg C: the SCR catalyst converts from about here
@@ -77,11 +74,6 @@ const LABELS = {
     inj1: 'Injector 1', inj2: 'Injector 2', inj3: 'Injector 3', inj4: 'Injector 4', inj5: 'Injector 5', inj6: 'Injector 6',
 };
 
-function writeWhole(file, text) {
-    const tmp = file + '.' + process.pid + '.tmp';
-    fs.writeFileSync(tmp, text);
-    fs.renameSync(tmp, file);
-}
 const two = (n) => (n < 10 ? '0' : '') + n;
 /** 146240 -> '146,240' */
 const thousands = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
@@ -107,14 +99,10 @@ async function background(bg) {
     });
     const reader = new Reader({ signals, log, settings, canRead: () => !st.left, engineType: () => engine.detected() }).start();
     const regen = new Regen({ file: path.join(bg.dataDir, 'diesel.json'), log });
-    regen.onEvent((what) => {
-        if (settings.get('regenFlash') !== true) return;
-        try { writeWhole(AMBIENT_FLASH, JSON.stringify({ rgb: FLASH[what], ms: 1500 }) + '\n'); } catch (e) { log.warn('ambient flash: ' + e); }
-    });
     let fedAt = 0, ran = false;
     setInterval(() => {
         const running = typeof st.rpm === 'number' && st.rpm >= RUN_RPM;
-        reader.want('bg', running && settings.get('demo') !== 'on' ? BG_KEYS : [], regen.run ? BG_REGEN_MS : BG_MS);
+        reader.want('bg', running && settings.get('demo') !== 'on' ? BG_KEYS : [], regen.run || regen.ending ? BG_REGEN_MS : BG_MS);
         if (!reader.diesel) return;
         if (ran && !running) regen.feed({ engine: false });
         ran = running;
@@ -137,7 +125,7 @@ mgu.run({
         const { ui, settings } = ctx;
         const bgs = ctx.background || await background(ctx);
         const reader = bgs.reader, regen = bgs.regen;
-        let page = 0, detail = 0, detailT = Date.now();
+        let page = 0, detail = 0, detailT = Date.now(), lastDemo = null;
 
         // ---- demo: Always, or Auto while the link isn't there and nothing has answered
         let demoReader = null, demoRegen = null;
@@ -148,6 +136,8 @@ mgu.run({
             return demoReader;
         };
         const rg = () => (demo() ? (src(), demoRegen) : regen);
+        const d0 = () => (demo() ? 'demo' : 'car');
+        const six = { demo: false, car: false };
 
         // ---- units
         const F = () => settings.get('tempUnit') === 'f', MI = () => settings.get('distUnit') === 'mi';
@@ -199,9 +189,9 @@ mgu.run({
             const amb = v('ambient') !== null ? v('ambient') : 1013;
             const boost = v('boostAbs') !== null ? (v('boostAbs') - amb) / 1000 : null;
             const boostT = v('boostSetAbs') !== null ? (v('boostSetAbs') - amb) / 1000 : null;
-            // injectors: six when the fifth or sixth answers with something, else four (B47)
-            const six = [v('inj5'), v('inj6')].some((x) => G.isNum(x) && Math.abs(x) > 0.005);
-            const inj = D.INJ.slice(0, six ? 6 : 4).map((k) => v(k));
+            // injectors: six once the fifth or sixth has answered with something (B57), else four (B47)
+            if ([v('inj5'), v('inj6')].some((x) => G.isNum(x) && Math.abs(x) > 0.005)) six[d0()] = true;
+            const inj = D.INJ.slice(0, six[d0()] ? 6 : 4).map((k) => v(k));
             // the cylinder each of them belongs to (dde.js FIRING: they come in firing order), else as numbered
             const firing = D.FIRING && D.FIRING[inj.length];
             const injCyl = inj.map((q, i) => (firing && firing.length === inj.length ? firing[i] : i + 1));
@@ -470,7 +460,7 @@ mgu.run({
                     { label: 'Distance', w: 120, align: 'right' }, { label: 'Soot', w: 180, align: 'right' }, { label: 'Peak', w: 108, align: 'right' }],
                     shown.map((e) => [day(e.t0), time(e.t0), has(e.interval) ? big(Dk(e.interval)) + ' ' + dU() : '--', has(e.s) ? Math.max(1, Math.round(e.s / 60)) + ' min' : '--',
                         has(e.km) ? num(Dk(e.km), 0) + ' ' + dU() : '--', has(e.soot0) || has(e.soot1) ? num(e.soot0, 1) + ' to ' + num(e.soot1, 1) + ' g' : '--',
-                        has(e.peak) ? Math.round(T(e.peak)) + ' ' + tU() : '--']),
+                        has(e.peak) ? Math.round(T(e.peak)) + tU() : '--']),
                     { rowH: rh, size: 26, headerSize: hs, middle: true });
                 // how each ended: a pill (as Service's)
                 shown.forEach((e, i) => {
@@ -682,14 +672,15 @@ mgu.run({
                 message(cv, t, d.status === 'NO LINK' ? 'No diagnostic link' : parked ? 'The car is parked and locked' : 'The engine unit doesn\'t answer',
                     d.status === 'NO LINK' ? 'The head unit\'s diagnostic service isn\'t there yet.' : 'Switch the ignition on or start the engine.', null, parked ? t.text : null);
             } else [renderDpf, renderRegens, renderAdblue, renderEngine, renderDetails][page](cv, t, d, now);
-            const state = d.demo ? 'DEMO' : d.status;
-            // (REGEN, not the whole word: with it and the state's badge the header still has room for the app's name, so the
-            // tabs stay where they are when a regeneration starts or the page turns)
+            // the state's badge: an unverified engine unit's LIVE says UNVERIFIED instead (two badges at most: with REGEN, not
+            // the whole word, the header still has room for the app's name, so the tabs stay where they are)
+            const state = d.demo ? 'DEMO' : d.status === 'LIVE' && d.diesel && !d.verified ? 'UNVERIFIED' : d.status;
             G.frame(cv, t, TABS, page, [
                 d.phase === 'active' && page !== 0 && { text: 'REGEN', color: t.warn },
-                d.diesel && !d.verified && !d.demo && { text: 'UNVERIFIED', color: t.warn },
                 { text: state, color: state === 'LIVE' ? BLUE : t.warn },
             ]);
+            // the demo switched off (the link came up) or on: what to read follows
+            if (d.demo !== lastDemo) { lastDemo = d.demo; wanted(); }
             return ui.image('MAIN_GFX', cv);
         }
 
