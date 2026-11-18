@@ -20,8 +20,7 @@ nothing but `22` (ReadDataByIdentifier) leave the head unit; the app cannot star
 | **Engine** | The EGR valves, high and low pressure: OPEN / CLOSED, how far (%), the engine unit's target; the share of exhaust let back in, air mass per stroke against its target; rail pressure and boost against their targets; the injectors' quantity corrections (fuel balancing, mg/stroke, meaningful at warm idle). |
 | **Details** | Every value read: its name, identifier, value and the reply's bytes, or why it has none (*reading...*, *not on this car*, *no answer*, *refused now*). |
 
-Settings: flash the ambient light when a regeneration starts and ends (amber, then green or red; needs Ambient config
-with its flash alerts on), km or miles, °C or °F, theme, layout, renderer, demo.
+Settings: km or miles, °C or °F, theme, layout, renderer, demo.
 
 ## Regenerations
 
@@ -30,14 +29,20 @@ with its flash alerts on), km or miles, °C or °F, theme, layout, renderer, dem
 So the app decides by, in this order:
 
 1. **The engine unit's after-treatment status** (DDE 8.3 only, `5372`, the shape of OBD PID 8B: bit 0 = regenerating),
-   once it has been seen at 0 too (a flag stuck at 1 is no flag).
-2. **The heat** before the filter (`44EF`, else the sensor value `4502`): 500 °C or more for 30 s starts one,
-   under 420 °C for 30 s ends it. Driving alone doesn't get the filter's inlet that hot on these engines; a
-   regeneration runs at about 600 °C.
+   together with the heat until it has been seen both at 0 and at 1, then alone (a flag stuck at either is no flag).
+2. **The heat** before the filter (`44EF`, else the sensor value `4502`): 500 °C or more for 30 s, with the soot at
+   least half way to the regeneration point, starts one; under 420 °C for 30 s ends it. A regeneration runs at about
+   600 °C; one by the heat that burnt no soot (towing, a long climb at full load) isn't logged.
+
+A pause of less than 3 minutes (a stop at the lights, the engine unit holding it) goes on as the same regeneration, and
+so does one the app was restarted in the middle of. Durations add up the time between reads while the engine runs: the
+head unit sets its wall clock late and corrects it, by hours, so clock differences would lie.
 
 **Done or stopped.** A regeneration is *done* when the distance since the last successful one (`44BF`) starts again
-from 0, which is BMW's own marker of a successful regeneration; if that hasn't happened within 3 minutes of its end
-(or the engine was switched off), it counts as *stopped early*.
+from 0, which is BMW's own marker of a successful regeneration; if that hasn't happened after 3 minutes of engine
+running since its end (with that distance read: the next drive's first read decides when the engine was switched off
+in the meantime), it counts as *stopped early*. A reset the app saw without having seen the regeneration run (it
+wasn't running, or it was too short to tell) is logged as done, without its duration.
 
 **The regeneration point** (the mark on the soot bar) is, in this order: the soot against the engine unit's own load
 (DDE 8.3, `5371`: 0 % after a regeneration, 100 % = due), its average soot at a regeneration's start (`4B52`), the
@@ -62,7 +67,8 @@ The engine unit tells its SGBD by its SGBD index (`22 F1 50`):
 | DDE 9 | `D94BX7A0` (2020+ mild hybrids) | `0F2C80` | no public SGBD: read like DDE 8.3, marked **UNVERIFIED** |
 
 An engine unit whose index isn't here is read like DDE 8.3 (UNVERIFIED) when the car's engine type says diesel or it
-answers soot and the distance since the last regeneration plausibly; a petrol one is left alone.
+answers soot and the distance since the last regeneration plausibly; one of BMW's petrol engine units (by its index) is
+left alone, and an unknown one only when it refuses both as unknown (NRC 31).
 
 | Value | DDE 8.3 | DDE 7 | Scaling |
 |---|---|---|---|
@@ -80,7 +86,7 @@ answers soot and the distance since the last regeneration plausibly; a petrol on
 | Load against the regeneration point | `5371` | — | (u16 − 32767) × 100 / 255 % |
 | Average soot at a regeneration's start / end | `4B52` / `4B53` | — | u16 × 0.01 − 327.67 g |
 | AdBlue range, NOx before / after the SCR, SCR catalyst, before it, average conversion | `4692`, `450A` / `4508`, `532E`, `5308`, `4DF7` | same | km × 0.15259022, ppm × 0.03204395 − 100, °C × 0.03128099 − 50, × 0.001 |
-| AdBlue quality, in the tank as the DDE receives it | `469C`, `4693` | — | u8 × 0.2 %, u16 × 0.5 g (unverified: the level's fallback) |
+| AdBlue quality; in the tank as the DDE receives it | `469C`; `4693` | —; `4693` | u8 × 0.2 %; u16 × 0.5 g (unverified: the level's fallback) |
 | EGR high pressure: position / target | `4D8C` / `4D8A` | `4C97` / `4C93` | DDE 8: u16 × 0.01220703 − 399.98779297 %; DDE 7: u16 × 0.004578 − 100 % |
 | EGR low pressure: position / target | `4D3B` / `4D39` | `4C73` / — | as above (DDE 7 has only a duty cycle as target) |
 | EGR rate, air mass per stroke / target | `4D88`, `47DD` / `4872` | same | × 0.01 %, × 0.03891051 / × 0.03051804 mg |
@@ -90,11 +96,12 @@ answers soot and the distance since the last regeneration plausibly; a petrol on
 
 The AdBlue unit: tank level `E439` (SCR04, index `0F2940`) or `D4D1` (SCR03, `0F22B0`), u16 × 0.00097656 l.
 
-The injector corrections follow the engine unit's own numbering (the SGBD names them cylinders 1-6; the Bosch
-labels count them in firing order); a B47 shows four (the fifth and sixth read 0).
+The injector corrections are in firing order (the SGBDs: *"Zylinderspezifische FBC-Ausgleichsmenge für Zylinder N
+(in Zündfolge)"*): the Engine page puts each under its cylinder, B47 1-3-4-2, B57 1-5-3-6-2-4 (six once the fifth or
+sixth slot has read anything but 0).
 
 **Pacing:** one request at a time, 120 ms apart; each identifier is first read alone, and once its reply length is
-known, up to 8 go in one request. Live values every 1-2 s while their page is shown, the rest every 30 s. A refusal
+known, it goes with the others of its unit that are due or nearly due, up to 8 in one request. Live values every 1-2 s while their page is shown, the rest every 30 s. A refusal
 (`7F 22 31`) carries no identifier and every app on the head unit gets every reply, so an identifier counts as *not on
 this car* only after three refusals of its own single reads (and is asked again after a while).
 
