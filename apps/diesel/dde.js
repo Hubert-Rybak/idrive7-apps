@@ -27,6 +27,11 @@ const FAMILY = {
     '0F1F70': 'd7x', '0F1F80': 'd7x', '0F1F90': 'd7x', '0F1FA0': 'd7x',
     '0F2C80': 'd94',
 };
+// petrol engine units (the index's other "12 <index>" SGBDs: DME8FF_R, MEVD17, MSD8x, S55, S63TU, N63TU, DME_BX8, DME9x...):
+// definitely not a diesel, never probed
+const PETROL = ['0F1090', '0F1370', '0F1380', '0F13E0', '0F13F0', '0F1780', '0F17F0', '0F1810', '0F1910', '0F19E0', '0F1A10', '0F1A20',
+    '0F1D20', '0F1D22', '0F1D24', '0F1D26', '0F1EA0', '0F2220', '0F2422', '0F2424', '0F2426', '0F2427', '0F2428', '0F2429', '0F242A', '0F242C',
+    '0F242E', '0F2460', '0F25A0', '0F25A2', '0F26B4', '0F26B8', '0F26BC', '0F26E0', '0F26E4', '0F26E8', '0F28E0', '0F2930', '0F2E00'];
 // the AdBlue unit's index ("0B <index>"): SCR04 and SCR03 have the tank; SCR05 / SCR01 have no public layout we use
 const SCR_FAMILY = { '0F2940': 'scr04', '0F22B0': 'scr03' };
 // families read with another family's layouts, and shown as unverified
@@ -52,7 +57,7 @@ const VALUES = {
     soot: Object.assign({ unit: 'g', live: true }, same(u16('44BE', 0.01525902, 0, 0, 200))),           // the regeneration coordinator's soot mass
     sootMeas: Object.assign({ unit: 'g', live: true }, same(u16('44B9', 0.01, 0, 0, 200))),             // from the pressure drop
     sootSim: Object.assign({ unit: 'g', live: true }, same(u16('44C1', 0.01, 0, 0, 200))),              // the soot model
-    ash: Object.assign({ unit: 'g' }, same(u16('44BD', 0.01525902, 0, 0, 1000))),
+    ash: Object.assign({ unit: 'g' }, same(u16('44BD', 0.01525902, 0, 0, 900))),                       // (FF FF = 1,000 g: no value)
     dp: Object.assign({ unit: 'hPa', live: true }, same(u16('44ED', 0.04577707, -1000, -200, 1500))),   // pressure drop across the filter
     tDpf: Object.assign({ unit: '°C', live: true }, same(EGT('44EF'))),                                 // before the filter (corrected)
     tDpfSens: Object.assign({ unit: '°C', live: true }, same(EGT('4502'))),                             // the same, sensor value
@@ -67,7 +72,7 @@ const VALUES = {
     odo3: Object.assign({ unit: 'km' }, same(u32('44D3', 0.001, 0, 1, 3000000))),
     odo4: Object.assign({ unit: 'km' }, same(u32('44D4', 0.001, 0, 1, 3000000))),
     odo5: Object.assign({ unit: 'km' }, same(u32('44D5', 0.001, 0, 1, 3000000))),
-    lifeKm: Object.assign({ unit: 'km' }, same(u16('4C78', 10, 0, 0, 655350))),                         // the filter's remaining distance (service)
+    lifeKm: Object.assign({ unit: 'km' }, same(u16('4C78', 10, 0, 0, 600000))),                         // the filter's remaining distance (service; FF FF: none)
     rgnNum: Object.assign({ unit: '', live: true }, same(u8('44BB', 0, 255))),                          // PFltRgn_numRgn: regeneration requested / running (no table)
     rgnLock: Object.assign({ unit: '' }, same(u8('44C2', 0, 255))),                                     // PFltRgn_stLck: blocked (no table)
     rgnIntr: Object.assign({ unit: '' }, same(u16('44C0', 1, 0, 0, 65535))),                            // PFltRgn_stIntr: interrupted (no table)
@@ -80,8 +85,8 @@ const VALUES = {
 
     /* ---- AdBlue / SCR: the strategy and the NOx sensors are the DDE's, the tank the SCR unit's ---- */
     adRange: Object.assign({ unit: 'km' }, same(u16('4692', 0.15259022, 0, 0, 10000))),
-    adQual: { unit: '%', d83: u8('469C', 0, 60, { factor: 0.2 }) },
-    adMass: { unit: 'g', d83: u16('4693', 0.5, 0, 0, 30000) },                                          // the tank as the DDE receives it (unverified)
+    adQual: { unit: '%', d83: u8('469C', 0, 50.9, { factor: 0.2 }) },                                   // (FF = 51 %: no value)
+    adMass: Object.assign({ unit: 'g' }, same(u16('4693', 0.5, 0, 0, 30000))),                          // the tank as the DDE receives it (unverified)
     noxIn: Object.assign({ unit: 'ppm', live: true }, same(u16('450A', 0.03204395, -100, -50, 2000))), // before the SCR catalyst
     noxOut: Object.assign({ unit: 'ppm', live: true }, same(u16('4508', 0.03204395, -100, -50, 2000))),// after it
     scrT: Object.assign({ unit: '°C', live: true }, same(u16('532E', 0.03128099, -50, -45, 900))),     // the SCR catalyst
@@ -96,7 +101,7 @@ const VALUES = {
     egrLpSet: { unit: '%', live: true, d83: POS8('4D39') },                                            // (DDE 7: only a duty cycle)
     egrRate: Object.assign({ unit: '%', live: true }, same(u16('4D88', 0.01, 0, 0, 100))),              // exhaust gas let back in
     air: Object.assign({ unit: 'mg', live: true }, same(u16('47DD', 0.03891051, 0, 0, 2500))),          // air mass per stroke
-    airSet: Object.assign({ unit: 'mg', live: true }, same(u16('4872', 0.03051804, 0, 0, 2000))),
+    airSet: Object.assign({ unit: 'mg', live: true }, same(u16('4872', 0.03051804, 0, 0, 1900))),
     rail: Object.assign({ unit: 'bar', live: true }, same(u16('4748', 0.04577707, 0, 0, 3000))),
     railSet: Object.assign({ unit: 'bar', live: true }, same(u16('4715', 0.04577707, 0, 0, 3000))),
     boostAbs: Object.assign({ unit: 'hPa', live: true }, same(u16('4841', 0.15259022, 0, 300, 5000))), // absolute
@@ -109,7 +114,9 @@ const VALUES = {
     inj5: { unit: 'mg', d83: INJ8('5574'), d7x: INJ7('5574') },
     inj6: { unit: 'mg', d83: INJ8('5575'), d7x: INJ7('5575') },
 };
+// the injector corrections are in firing order (the SGBDs: "fuer Zylinder N (in Zuendfolge)"): slot i is cylinder FIRING[n][i]
 const INJ = ['inj1', 'inj2', 'inj3', 'inj4', 'inj5', 'inj6'];
+const FIRING = { 4: [1, 3, 4, 2], 6: [1, 5, 3, 6, 2, 4] };
 const ODO = ['odo1', 'odo2', 'odo3', 'odo4', 'odo5'];
 // keys read from the AdBlue unit (the rest: the engine unit)
 const ON_SCR = { adLevel: true };
@@ -123,6 +130,7 @@ function specOf(key, family) {
 
 /** The family of an engine unit's SGBD index ('0F2670' -> 'd83'), or null when it isn't a DDE we know. */
 const familyOf = (index) => FAMILY[String(index || '').toUpperCase()] || null;
+const petrol = (index) => PETROL.indexOf(String(index || '').toUpperCase()) >= 0;
 const scrFamilyOf = (index) => SCR_FAMILY[String(index || '').toUpperCase()] || null;
 const verified = (family) => family === 'd83' || family === 'd7x';
 
@@ -151,4 +159,4 @@ function rawOf(spec, data) {
     return raw;
 }
 
-module.exports = { DDE, SCR, FAMILY, SCR_FAMILY, NAMES, VALUES, INJ, ODO, ON_SCR, specOf, familyOf, scrFamilyOf, verified, decode, rawOf };
+module.exports = { DDE, SCR, FAMILY, PETROL, SCR_FAMILY, NAMES, VALUES, INJ, ODO, ON_SCR, FIRING, specOf, familyOf, petrol, scrFamilyOf, verified, decode, rawOf };

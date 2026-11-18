@@ -203,6 +203,41 @@ test('reader: a petrol engine unit is left alone; an unknown one that answers li
     });
 });
 
+test('reader: an unknown index is "not a diesel" only on two definite refusals; a tap on the tab asks again', async () => {
+    const u = { index: '0F3000', dids: {}, refuse: { '44BE': 0x22, '44BF': 0x22 } };
+    await reading({ 0x12: u }, {}, async (r, link) => {
+        r.want('ui', ['soot'], 100);
+        await until(() => link.sent.filter((x) => x === '12:22 F150').length >= 2, 9000, 'asked again after an inconclusive answer');
+        assert.strictEqual(r.family, null, '7F 22 22 (conditions) decides nothing');
+        u.refuse = { '44BE': 0x31, '44BF': 0x31 };
+        await until(() => r.family === 'other', 9000, 'refused as unknown: not a diesel');
+        assert.strictEqual(r.status(), 'NOT A DIESEL');
+        u.refuse = {}; u.dids = DDE83().dids;
+        r.refresh();
+        await until(() => r.value('soot') !== null, 9000, 'identified again on refresh');
+        assert.strictEqual(r.family, 'unknown');
+    });
+    await reading({ 0x12: { index: '0F26E8', dids: DDE83().dids } }, {}, async (r, link) => {
+        r.want('ui', ['soot'], 100);
+        await until(() => r.family !== null, 3000, 'identified');
+        r.refresh(); await sleep(400);
+        assert.strictEqual(r.family, 'other', 'a known petrol unit stays one');
+        assert.deepStrictEqual(link.sent, ['12:22 F150'], 'and is never probed');
+    });
+});
+
+test('reader: NO ANSWER holds until the engine unit answers again, not just until it is woken', () => reading({ 0x12: DDE83() }, {}, async (r, link) => {
+    let quiet = false;
+    link.silent = () => quiet;
+    r.want('ui', ['soot'], 100);
+    await until(() => r.value('soot') !== null, 4000, 'first value');
+    quiet = true; await sleep(700);
+    assert.strictEqual(r.status(), 'NO ANSWER');
+    quiet = false;                                                   // woken: the counter cleared, no answer yet
+    assert.strictEqual(r.status(), 'NO ANSWER', 'still, until a reply');
+    await until(() => r.status() === 'LIVE', 4000, 'live again after a reply');
+}));
+
 test('reader: DDE 7 reads its own EGR identifiers; the AdBlue unit\'s tank from 0x0B', () => {
     const dde7 = { index: '0F1F80', dids: { '4C97': u16(Math.round(125 / 0.004578)), '4C93': u16(Math.round(126 / 0.004578)), '4692': u16(Math.round(5000 / 0.15259022)) } };
     const scr = { index: '0F2940', dids: { E439: u16(Math.round(11.5 / 0.00097656)) } };
@@ -218,46 +253,99 @@ test('reader: DDE 7 reads its own EGR identifiers; the AdBlue unit\'s tank from 
 
 /* ---------- regen.js ---------- */
 const T0 = 1700000000000, S = 1000, MIN = 60 * S;
-function drive(rg, steps) { steps.forEach((s) => rg.feed(s[1], T0 + s[0])); }
+/**
+ * Feeds rg as the background does, every `every` ms: legs = [[ms, values], ...], each leg's values fed (the numbers
+ * held) until its time has passed; t continues from rg.t (wall clock).
+ */
+function drive(rg, legs, every) {
+    every = every || 5 * S;
+    if (rg.t === undefined) rg.t = T0;
+    legs.forEach((leg) => { const end = rg.t + leg[0]; do { rg.feed(leg[1], rg.t); rg.t += every; } while (rg.t < end); });
+}
+const events = (rg) => { const ev = []; rg.onEvent((w) => ev.push(w)); return ev; };
 
 test('regen: by the engine unit\'s flag, done when the distance since the last one starts again', () => {
-    const rg = new Regen({}), ev = [];
-    rg.onEvent((w, e) => ev.push(w));
-    drive(rg, [[0, { soot: 23.8, sinceKm: 430, pid8b: 0, tDpf: 300, engine: true, loadPct: 99 }],
-        [10 * S, { soot: 24.1, sinceKm: 431, pid8b: 3, tDpf: 450 }],
-        [8 * MIN, { soot: 12, sinceKm: 439, pid8b: 3, tDpf: 640 }]]);
+    const rg = new Regen({}), ev = events(rg);
+    drive(rg, [[10 * S, { soot: 23.8, sinceKm: 430, pid8b: 0, tDpf: 300, engine: true, loadPct: 99 }], [5 * S, { pid8b: 3, soot: 24.1 }],
+        [8 * MIN, { soot: 12, sinceKm: 431, tDpf: 640 }]]);
     assert.strictEqual(rg.state().phase, 'active'); assert.strictEqual(rg.state().by, 'flag');
-    near(rg.state().run.progress, (24.1 - 12) / (24.1 - 2), 1e-6, 'soot burnt');
-    drive(rg, [[15 * MIN, { soot: 2.4, sinceKm: 0.2, pid8b: 0, tDpf: 560 }]]);
+    near(rg.state().run.s, 8 * 60 + 5, 6, 'running time');
+    drive(rg, [[5 * S, { soot: 2.4, sinceKm: 0.2, pid8b: 0, tDpf: 560 }]]);
     assert.deepStrictEqual(ev, ['start', 'complete']);
     const e = rg.log[0];
-    assert.strictEqual(e.result, 'complete'); near(e.s, 15 * 60 - 10, 1); near(e.km, 439 - 431 + 0.2, 0.05); assert.strictEqual(e.interval, 431);
+    assert.strictEqual(e.result, 'complete'); near(e.s, 8 * 60 + 5, 6); assert.strictEqual(e.interval, 430);
     assert.strictEqual(e.soot0, 24.1); assert.strictEqual(e.soot1, 2.4); assert.strictEqual(e.peak, 640);
     assert.strictEqual(rg.state().phase, 'ok');
 });
 
-test('regen: one that ends without the distance starting again counts as stopped; the engine stopping ends it', () => {
-    const rg = new Regen({});
-    drive(rg, [[0, { soot: 24, sinceKm: 420, pid8b: 0, engine: true }], [S, { pid8b: 1 }], [5 * MIN, { soot: 20, sinceKm: 424, engine: false }]]);
-    assert.strictEqual(rg.run, null, 'ended with the engine');
-    drive(rg, [[5 * MIN + Regen.SETTLE_MS + S, { soot: 20, sinceKm: 424, pid8b: 0, engine: true }]]);
-    assert.strictEqual(rg.log[0].result, 'stopped'); assert.strictEqual(rg.log[0].soot1, 20);
+test('regen: a wall-clock jump of hours is no time; a short pause (lights) goes on as the same one', () => {
+    const rg = new Regen({}), ev = events(rg);
+    drive(rg, [[10 * S, { soot: 24, sinceKm: 420, pid8b: 0, engine: true }], [4 * MIN, { pid8b: 3, soot: 18 }]]);
+    rg.t += 2 * 3600 * S;                                                      // the head unit sets its clock
+    drive(rg, [[2 * MIN, { pid8b: 3, soot: 15 }], [40 * S, { pid8b: 2, soot: 15 }], [3 * MIN, { pid8b: 3, soot: 3 }]]);
+    rg.t -= 5 * 3600 * S;                                                      // and back
+    drive(rg, [[5 * S, { pid8b: 0, sinceKm: 0.3, soot: 2.5 }]]);
+    assert.deepStrictEqual(ev, ['start', 'complete'], 'one regeneration');
+    near(rg.log[0].s, 4 * 60 + 2 * 60 + 3 * 60, 15, 'its running time: the jumps and the pause left out');
 });
 
-test('regen: by the heat without a flag; a flag never seen at 0 is not trusted; no new one while the heat lingers', () => {
+test('regen: one that ends without the distance starting again counts as stopped, only once the distance was read', () => {
     const rg = new Regen({});
-    drive(rg, [[0, { soot: 24, sinceKm: 400, tDpf: 300, pid8b: 1, engine: true }]]);
-    for (let s = 1; s <= 25; s++) rg.feed({ tDpf: 600 }, T0 + s * S);
-    assert.strictEqual(rg.state().phase !== 'active', true, 'not yet: 30 s of heat');
-    for (let s = 26; s <= 40; s++) rg.feed({ tDpf: 600 }, T0 + s * S);
-    assert.strictEqual(rg.state().phase, 'active'); assert.strictEqual(rg.state().by, 'heat', 'the stuck flag (never 0) is not used');
-    drive(rg, [[10 * MIN, { sinceKm: 0.1, soot: 3, tDpf: 590 }]]);
-    assert.strictEqual(rg.log[0].result, 'complete');
-    for (let s = 1; s <= 60; s++) rg.feed({ tDpf: 580 }, T0 + 10 * MIN + s * S);
-    assert.strictEqual(rg.run, null, 'the lingering heat starts no new one');
-    for (let s = 1; s <= 40; s++) rg.feed({ tDpf: 300 }, T0 + 12 * MIN + s * S);
-    for (let s = 1; s <= 40; s++) rg.feed({ tDpf: 620 }, T0 + 14 * MIN + s * S);
-    assert.ok(rg.run, 'after cooling, heat again is a new one');
+    drive(rg, [[10 * S, { soot: 24, sinceKm: 420, pid8b: 0, engine: true }], [5 * MIN, { pid8b: 1, soot: 20 }], [S, { engine: false }]]);
+    assert.strictEqual(rg.run, null, 'ended with the engine');
+    // the next drive: the first feeds without the distance decide nothing
+    drive(rg, [[Regen.SETTLE_MS + MIN, { engine: true, pid8b: 0, soot: 20 }]]);
+    assert.strictEqual(rg.log.length, 0, 'not without the distance read');
+    drive(rg, [[5 * S, { sinceKm: 424 }]]);
+    assert.strictEqual(rg.log[0].result, 'stopped'); assert.strictEqual(rg.log[0].soot1, 20);
+    const r2 = new Regen({});
+    drive(r2, [[10 * S, { soot: 24, sinceKm: 420, pid8b: 0, engine: true }], [5 * MIN, { pid8b: 1, soot: 4 }], [S, { engine: false }],
+        [Regen.SETTLE_MS + MIN, { engine: true, pid8b: 0 }], [5 * S, { sinceKm: 0.4 }]]);
+    assert.strictEqual(r2.log[0].result, 'complete', 'its end read on the next drive: done');
+});
+
+test('regen: by the heat; a flag stuck at 0 or never seen at 0 doesn\'t stop it; no new one while the heat lingers', () => {
+    [{ pid8b: 1 }, { pid8b: 0 }, {}].forEach((flag) => {
+        const rg = new Regen({});
+        drive(rg, [[10 * S, Object.assign({ soot: 24, sinceKm: 400, tDpf: 300, engine: true }, flag)], [25 * S, { tDpf: 600 }]]);
+        assert.ok(!rg.run, 'not yet: 30 s of heat');
+        drive(rg, [[15 * S, { tDpf: 600 }]]);
+        assert.ok(rg.run, 'running by the heat, flag ' + JSON.stringify(flag)); assert.strictEqual(rg.state().by, 'heat');
+        drive(rg, [[10 * MIN, { tDpf: 610, soot: 3 }], [5 * S, { sinceKm: 0.1, tDpf: 590 }]]);
+        assert.strictEqual(rg.log[0].result, 'complete');
+        drive(rg, [[MIN, { tDpf: 580 }]]);
+        assert.strictEqual(rg.run, null, 'the lingering heat starts no new one');
+    });
+    const rg = new Regen({});
+    drive(rg, [[10 * S, { soot: 24, sinceKm: 400, tDpf: 300, engine: true }], [MIN, { tDpf: 620 }], [10 * MIN, { soot: 3, tDpf: 620 }],
+        [5 * S, { sinceKm: 0.1 }], [MIN, { tDpf: 300 }], [10 * S, { soot: 14 }], [MIN, { tDpf: 620 }]]);
+    assert.ok(rg.run, 'after cooling, heat again (soot half way) is a new one');
+});
+
+test('regen: heat that burns no soot (towing) is not logged; a low soot is no regeneration by heat', () => {
+    const rg = new Regen({}), ev = events(rg);
+    drive(rg, [[10 * S, { soot: 20, sinceKm: 200, tDpf: 300, engine: true }], [4 * MIN, { tDpf: 530, soot: 20.1 }], [Regen.SETTLE_MS + MIN, { tDpf: 380, soot: 20.3, sinceKm: 204 }]]);
+    assert.deepStrictEqual(ev, ['start']); assert.strictEqual(rg.log.length, 0, 'dropped');
+    const r2 = new Regen({});
+    drive(r2, [[10 * S, { soot: 6, sinceKm: 60, tDpf: 300, engine: true }], [4 * MIN, { tDpf: 540 }]]);
+    assert.strictEqual(r2.run, null, '6 g of 24: not a regeneration');
+});
+
+test('regen: a restart in the middle goes on with the same one; a reset without a start is logged by its end', () => {
+    const dir = tmp('diesel-'), file = path.join(dir, 'diesel.json');
+    try {
+        const a = new Regen({ file });
+        drive(a, [[10 * S, { soot: 24, sinceKm: 430, pid8b: 0, engine: true }], [MIN, { pid8b: 3 }], [2 * MIN, { pid8b: 3, soot: 18 }]]);
+        a.save(true);
+        const b = new Regen({ file }), ev = events(b);
+        b.t = a.t + 20 * S;
+        drive(b, [[10 * S, { soot: 17.5 }], [3 * MIN, { pid8b: 3, soot: 10 }], [5 * S, { pid8b: 0, sinceKm: 0.2, soot: 2.6 }]]);
+        assert.deepStrictEqual(ev, ['complete'], 'no stop, no second start');
+        assert.strictEqual(b.log.length, 1); assert.strictEqual(b.log[0].soot0, 24); near(b.log[0].s, 6 * 60 + 10, 15);
+        const c = new Regen({});
+        drive(c, [[10 * S, { soot: 20, sinceKm: 380, engine: true }], [5 * S, { sinceKm: 0.3, soot: 2.2 }]]);
+        assert.strictEqual(c.log[0].by, 'reset'); assert.strictEqual(c.log[0].interval, 380); assert.strictEqual(c.log[0].s, null);
+    } finally { rmTree(dir); }
 });
 
 test('regen: the regeneration point from the load %, the average start, the log, else typical; due and requested', () => {
@@ -277,7 +365,7 @@ test('regen: the regeneration point from the load %, the average start, the log,
 });
 
 test('regen: the app\'s distance through resets, the soot history, saved and loaded', () => {
-    const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'diesel-')), file = path.join(dir, 'diesel.json');
+    const dir = tmp('diesel-'), file = path.join(dir, 'diesel.json');
     try {
         const rg = new Regen({ file });
         let t = T0;
@@ -291,7 +379,7 @@ test('regen: the app\'s distance through resets, the soot history, saved and loa
         rg.save(true);
         const back = new Regen({ file });
         near(back.dist, rg.dist, 0.01); assert.strictEqual(back.samples.length, rg.samples.length); assert.strictEqual(back.lastSince, rg.lastSince);
-        assert.strictEqual(back.seen0.pid8b, true);
+        assert.strictEqual(back.seen0.pid8b, true); assert.deepStrictEqual(back.log.map((e) => e.by), rg.log.map((e) => e.by));
         fs.writeFileSync(file, '{ broken');
         assert.strictEqual(new Regen({ file }).dist, 0, 'a broken file starts afresh');
     } finally { rmTree(dir); }
@@ -354,14 +442,14 @@ async function app(opts) {
     return { pages, logs, tab, handlers };
 }
 const stand = (o) => Object.assign({ replied: false, family: null, index: null, scr: undefined, scrIndex: null, diesel: false, verified: false, lastGood: 0,
-    link: { available: false, ready: false }, want() {}, refresh() {}, start() { return this; }, value: () => null, raw: () => null, why: () => 'reading...',
+    link: { available: false, ready: false }, want() {}, refresh() {}, start() { return this; }, value: () => null, raw: () => null, age: () => null, why: () => 'reading...',
     status: () => 'NO LINK', rows: () => [] }, o);
 
 test('main: every page in the demo, with no link and on a petrol engine unit, draws without an error', async () => {
     const demo = await app({ reader: stand(), sets: { demo: 'auto' } });
     assert.ok(/FILTER OK|REGENERATING|REGENERATION DUE/.test(demo.pages[0]), 'DPF status: ' + demo.pages[0].slice(0, 300));
     assert.ok(/DEMO/.test(demo.pages[0]));
-    assert.ok(/done|stopped early/.test(demo.pages[1]), 'the demo log');
+    assert.ok(/ min /.test(demo.pages[1] + ' ') && / g/.test(demo.pages[1]), 'the demo log: ' + demo.pages[1].slice(0, 400));
     assert.ok(/ppm/.test(demo.pages[2]), 'AdBlue (NOx in ppm): ' + demo.pages[2].slice(0, 300));
     assert.ok(/OPEN|CLOSED/.test(demo.pages[3]), 'Engine: ' + demo.pages[3].slice(0, 300));
     assert.ok(/44BE/.test(demo.pages[4]), 'Details: ' + demo.pages[4].slice(0, 300));
