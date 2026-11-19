@@ -2,7 +2,7 @@
   "id": "diesel",
   "title": "Diesel",
   "description": "Diesel particulate filter: soot and ash, regeneration state and log, request a regeneration, AdBlue, EGR valves and injectors (B47 / B57)",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "vendor": "custom",
   "loggingId": "OAA5",
   "iconGlyph": "DPF",
