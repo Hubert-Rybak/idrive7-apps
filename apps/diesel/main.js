@@ -82,6 +82,16 @@ const LABELS = {
 };
 
 const two = (n) => (n < 10 ? '0' : '') + n;
+/**
+ * v as shown: held while it stays within band of the value shown (the regeneration point from the load % moves a
+ * little with every reading, and the soot bar's amber zone, its mark and label would jump with it). hold: { key: v }.
+ */
+function steady(hold, key, v, band) {
+    if (typeof v !== 'number' || !isFinite(v)) { hold[key] = null; return v; }
+    if (typeof hold[key] !== 'number' || Math.abs(v - hold[key]) >= band) hold[key] = v;
+    return hold[key];
+}
+const POINT_BAND = 1;                 // g: the regeneration point shown moves once the real one is this far from it
 /** 146240 -> '146,240' */
 const thousands = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
@@ -148,6 +158,7 @@ mgu.run({
         const rg = () => (demo() ? (src(), demoRegen) : regen);
         const d0 = () => (demo() ? 'demo' : 'car');
         const six = { demo: false, car: false };
+        const point = {};                // the regeneration point shown, per source (steady())
 
         // ---- units
         const F = () => settings.get('tempUnit') === 'f', MI = () => settings.get('distUnit') === 'mi';
@@ -218,7 +229,7 @@ mgu.run({
             return {
                 demo: demo(), status: s.status(), diesel: s.diesel, family: s.family, verified: s.verified, index: s.index, scr: s.scr, scrIndex: s.scrIndex,
                 v, why, age: (k) => (typeof s.age === 'function' ? s.age(k) : null),
-                soot: v('soot'), sootMeas: v('sootMeas'), sootSim: v('sootSim'), sootMax: st.threshold, thrBy: st.thresholdBy, load: st.load,
+                soot: v('soot'), sootMeas: v('sootMeas'), sootSim: v('sootSim'), sootMax: steady(point, d0(), st.threshold, POINT_BAND), thrBy: st.thresholdBy, load: st.load,
                 ash: v('ash'), lifeKm: v('lifeKm'), dp: v('dp'), tIn, tDoc: v('tDoc'),
                 phase: st.phase, by: st.by, requested: st.requested, run: st.run, nextKm: st.nextKm,
                 sinceKm: v('sinceKm'), sinceS: v('sinceS'), sinceL: v('sinceL'), regens: v('regens'), avgKm: v('avgKm'),
