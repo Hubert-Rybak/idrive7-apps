@@ -9,8 +9,10 @@ OBD `01` / `09`) leave the head unit; this app reads with `22` (ReadDataByIdenti
 
 > **Status: experimental.** The identifiers and their scalings come from the engine units' SGBDs (the public
 > [EDIABAS reference](https://emdzej.github.io/ediabasx-docs-sgbd/)), each checked field by field against the SGBD's
-> own tables, but not yet against a running car. The *Details* tab shows every value with its identifier and the
-> reply's bytes: a photo of it (or Settings > QR log) is what's needed to confirm them.
+> own tables. **Tested on a car:** a G05 xDrive40d (2021, B57 mild hybrid, DDE 8.3 `0F267C`, AdBlue unit SCR04):
+> every value answered and decoded as expected, and a regeneration requested from the app ran. DDE 7 and DDE 9 are
+> not tried on a car yet. The *Details* tab shows every value with its identifier and the reply's bytes: a photo of
+> it (or Settings > QR log) is what's needed to confirm them on another engine unit.
 
 ## Pages
 
@@ -77,7 +79,8 @@ driving allows (the DDE 7 / 9 block's `06 05` names the value: service case 6, E
 `6E 5F B4` means accepted; a refusal is shown with its reason. Nothing is sent while one runs, while the engine unit
 blocks regenerations (`44C2` = 1), for an engine unit whose family the app doesn't know or without a live engine unit
 (the sheet says why); after an accepted request there is none for 10 minutes. In the demo nothing is sent.
-**Not yet tried on a car by this app**: the bytes are BimmerLink's, the reading of them is the SGBD's.
+Tried on a car with DDE 8.3 (the G05 above): accepted, and the regeneration ran. The DDE 7 / 9 block is not tried
+on a car yet; the bytes are BimmerLink's, the reading of them is the SGBD's.
 
 **In the background** (`app.json` `autostart`): while the engine runs (rpm from the car's signal, not a request) the
 filter's values are read every 20 s, every 5 s during a regeneration; nothing at all once the car is locked and left
@@ -93,7 +96,7 @@ The engine unit tells its SGBD by its SGBD index (`22 F1 50`):
 |---|---|---|---|
 | DDE 8.3 | `D83BX7C0` (G-series B47 / B57) | `0F1FE8` `0F1FF0` `0F1FF4` `0F1FF8` `0F2670` `0F2674` `0F2678` `0F267C` | as in the SGBD |
 | DDE 7 | `D75BX7A0`, `D70BX7A0` (F-series B47 / N47 / N57) | `0F1F70` `0F1F80` `0F1F90` `0F1FA0` | the filter's the same; EGR and injectors their own; no `53xx` / `4B5x` |
-| DDE 9 | `D94BX7A0` (2020+ mild hybrids) | `0F2C80` | no public SGBD: read like DDE 8.3, marked **UNVERIFIED** |
+| DDE 9 | `D94BX7A0` (the newest DDE) | `0F2C80` | no public SGBD: read like DDE 8.3, marked **UNVERIFIED** |
 
 An engine unit whose index isn't here is read like DDE 8.3 (UNVERIFIED) when the car's engine type says diesel or it
 answers soot and the distance since the last regeneration plausibly; one of BMW's petrol engine units (by its index) is
