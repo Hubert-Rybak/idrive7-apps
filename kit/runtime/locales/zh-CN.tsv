@@ -1701,6 +1701,42 @@ SOOT, BANK 1	碳烟，气缸列 1
 SOOT, BANK 2	碳烟，气缸列 2
 Bank 1	气缸列 1
 # Diesel
+Press Request regeneration again to send it, Next page to cancel	再次按“请求再生”即发送，按“下一页”取消
+No engine start once the range is used up	续航里程耗尽后发动机将无法启动
+estimated, from the engine unit's figure	估算值，来自发动机控制单元的数据
+DPF REGEN	DPF 再生
+Regeneration	再生
+The one before	前一次
+Third last	倒数第三次
+Fourth last	倒数第四次
+Fifth last	倒数第五次
+minutes	分钟
+link busy	诊断连接忙
+reply too short	响应过短
+value out of range	数值超出范围
+AdBlue unit	AdBlue 控制单元
+mg/stroke	mg/冲程
+Operating mode	运行模式
+Request regeneration	请求再生
+Requested from the app	已从应用请求
+The engine unit is told that a regeneration is due, and runs it once the driving allows:	发动机控制单元会被告知需要再生，并在行驶条件允许时执行：
+The engine warm: coolant over 75°C	发动机已热机：冷却液高于 75°C
+The engine warm: coolant over 167°F	发动机已热机：冷却液高于 167°F
+Fuel not on reserve, no exhaust or sensor faults stored	燃油未进入储备，且无排气或传感器故障记录
+20-30 min at a steady 60 km/h or more; don't switch the engine off while it runs	以 60 km/h 以上匀速行驶 20-30 分钟；再生期间不要关闭发动机
+20-30 min at a steady 40 mph or more; don't switch the engine off while it runs	以 40 mph 以上匀速行驶 20-30 分钟；再生期间不要关闭发动机
+Demo: nothing is sent to the car.	演示：不会向车辆发送任何内容。
+One write to the engine unit, as BimmerLink sends it. Not tried on every engine unit.	向发动机控制单元写入一次，与 BimmerLink 发送的相同。并非所有发动机控制单元都试过。
+Not sent	未发送
+Send request	发送请求
+Requesting...	正在请求...
+Send again	再次发送
+Cancel	取消
+not for this engine unit	不适用于此发动机控制单元
+the engine unit isn't answering	发动机控制单元无响应
+blocked by the engine unit	被发动机控制单元锁定
+already requested	已请求
+unexpected answer	意外的响应
 Regenerations	再生
 ADBLUE OK	AdBlue 正常
 REFILL SOON	即将需要加注

@@ -1,8 +1,8 @@
 {
   "id": "diesel",
   "title": "Diesel",
-  "description": "Diesel particulate filter: soot and ash, regeneration state and log, AdBlue, EGR valves and injectors (B47 / B57)",
-  "version": "0.9.0",
+  "description": "Diesel particulate filter: soot and ash, regeneration state and log, request a regeneration, AdBlue, EGR valves and injectors (B47 / B57)",
+  "version": "0.10.0",
   "vendor": "custom",
   "loggingId": "OAA5",
   "iconGlyph": "DPF",
@@ -28,7 +28,7 @@
   },
   "screens": [
     { "name": "MAIN", "kind": "canvas", "title": "Diesel",
-      "buttons": [["BTN_PAGE", "Next page"], ["BTN_PREV", "Previous page"], ["BTN_SETTINGS", "Settings"]] }
+      "buttons": [["BTN_PAGE", "Next page"], ["BTN_PREV", "Previous page"], ["BTN_REGEN", "Request regeneration"], ["BTN_SETTINGS", "Settings"]] }
   ],
   "settings": [
     {"key": "distUnit", "label": "Distance unit", "type": "choice", "default": "km",
@@ -44,5 +44,5 @@
     {"key": "demo", "label": "Demo data", "type": "choice", "default": "auto",
      "options": [["auto", "Auto"], ["on", "Always"], ["off", "Never"]]}
   ],
-  "config": { "ddeAddress": 18, "scrAddress": 11, "readOnly": true }
+  "config": { "ddeAddress": 18, "scrAddress": 11, "readOnly": false }
 }

@@ -1,7 +1,8 @@
 'use strict';
 /**
  * Diesel - the diesel particulate filter (DPF) and the rest of a B47 / B57's exhaust after-treatment, read from the
- * engine unit (DDE) over the head unit's diagnostic link, reading only (reader.js, kit/readonly-diag.js).
+ * engine unit (DDE) over the head unit's diagnostic link: reading (reader.js, kit/readonly-diag.js), but for the
+ * regeneration request the driver confirms (force.js).
  *
  *   DPF            one glance: FILTER OK / REGENERATION DUE / REGENERATING (keep driving, don't switch the engine off),
  *                  the soot against the regeneration point, since the last one and the next; the heat into the filter,
@@ -14,6 +15,9 @@
  *   Engine         each EGR valve OPEN / CLOSED (how far, the target), EGR rate, air mass; rail pressure and boost against
  *                  their targets, the injectors' quantity corrections
  *   Details        every value with its identifier, the reply's bytes and why one has none: what the car really sends
+ *
+ * Request regeneration (the bar's button: a sheet on the DPF page): after the driver confirms, the one write the app sends (force.js,
+ * as BimmerLink does it): the engine unit then counts a regeneration as due and runs it once the driving allows.
  *
  * In the background (app.json autostart; regen.js): while the engine runs, the filter's values every 20 s (5 s during a
  * regeneration and until it is told done or stopped), so each regeneration is logged even with the app closed; nothing
@@ -31,23 +35,24 @@ const Engine = require('./kit/engine');
 const { Reader } = require('./reader');
 const { Regen } = require('./regen');
 const { DemoReader } = require('./demo');
+const { Force } = require('./force');
 const D = require('./dde');
 
 const W = 1600, H = 520;
 const GO = '#2fd27a', BLUE = '#81c4ff';
 const TABS = ['DPF', 'Regenerations', 'AdBlue', 'Engine', 'Details'];
 const DPF_KEYS = ['soot', 'sootMeas', 'sootSim', 'ash', 'dp', 'tDpf', 'tDpfSens', 'tDoc', 'sinceKm', 'sinceS', 'sinceL', 'regens', 'avgKm', 'lifeKm',
-    'pid8b', 'rgnNum', 'loadPct', 'avgStart', 'avgEnd'];
+    'opMode', 'pid8b', 'rgnNum', 'rgnLock', 'loadPct', 'avgStart', 'avgEnd'];
 const PAGE_KEYS = [
     DPF_KEYS.concat(['egrHp', 'egrLp']),          // (the EGR valves' state in short, on the DPF page too)
-    ['soot', 'tDpf', 'tDpfSens', 'sinceKm', 'regens', 'avgKm', 'pid8b', 'rgnNum', 'loadPct', 'avgStart', 'avgEnd'].concat(D.ODO),
+    ['soot', 'tDpf', 'tDpfSens', 'sinceKm', 'regens', 'avgKm', 'opMode', 'pid8b', 'rgnNum', 'loadPct', 'avgStart', 'avgEnd'].concat(D.ODO),
     ['adLevel', 'adRange', 'adQual', 'adMass', 'noxIn', 'noxOut', 'scrT', 'tScr', 'scrEff'],
     ['egrHp', 'egrHpSet', 'egrLp', 'egrLpSet', 'egrRate', 'air', 'airSet', 'rail', 'railSet', 'boostAbs', 'boostSetAbs', 'ambient'].concat(D.INJ),
     Object.keys(D.VALUES),
 ];
 const PAGE_MS = [2000, 5000, 2000, 1000, 2000];
 // what the background follows while the engine runs: enough to see a regeneration start and end
-const BG_KEYS = ['soot', 'tDpf', 'tDpfSens', 'sinceKm', 'pid8b', 'rgnNum', 'loadPct', 'avgKm', 'avgStart', 'avgEnd', 'regens'];
+const BG_KEYS = ['soot', 'tDpf', 'tDpfSens', 'sinceKm', 'opMode', 'pid8b', 'rgnNum', 'loadPct', 'avgKm', 'avgStart', 'avgEnd', 'regens'];
 const BG_MS = 20000, BG_REGEN_MS = 5000, RUN_RPM = 400, TICK_MS = 1000;
 const KM_MI = 0.621371;
 const AD_DENSITY = 1090;              // g per litre of AdBlue (32.5 % urea)
@@ -67,7 +72,7 @@ const LABELS = {
     tDpfSens: 'Before the filter, sensor', tDoc: 'Before the oxidation cat', sinceKm: 'Since the last regeneration', sinceS: 'Engine time since it',
     sinceL: 'Fuel since it', regens: 'Regenerations', avgKm: 'Average interval', odo1: 'Last regeneration at', odo2: 'The one before at',
     odo3: 'Third last at', odo4: 'Fourth last at', odo5: 'Fifth last at', lifeKm: 'Filter life left', rgnNum: 'Regeneration request',
-    rgnLock: 'Regeneration lock', rgnIntr: 'Regeneration interrupted', pid8b: 'After-treatment status', loadPct: 'Load, regeneration point',
+    rgnLock: 'Regeneration lock', rgnIntr: 'Regeneration interrupted', opMode: 'Operating mode', pid8b: 'After-treatment status', loadPct: 'Load, regeneration point',
     avgStart: 'Average soot at a start', avgEnd: 'Average soot at an end', adRange: 'AdBlue range', adQual: 'AdBlue quality',
     adMass: 'AdBlue, engine unit', noxIn: 'NOx before the SCR', noxOut: 'NOx after the SCR', scrT: 'SCR catalyst', tScr: 'Before the SCR',
     scrEff: 'SCR conversion, average', adLevel: 'AdBlue level', egrHp: 'EGR, high pressure', egrHpSet: 'EGR high, target',
@@ -112,7 +117,7 @@ async function background(bg) {
         fedAt = reader.lastGood;
         const v = {};
         ['soot', 'sinceKm', 'pid8b', 'rgnNum', 'loadPct', 'avgStart', 'avgEnd', 'avgKm', 'regens'].forEach((k) => { v[k] = reader.value(k); });
-        v.pid8b = reader.raw('pid8b'); v.rgnNum = reader.raw('rgnNum');
+        v.opMode = reader.raw('opMode'); v.pid8b = reader.raw('pid8b'); v.rgnNum = reader.raw('rgnNum');
         v.tDpf = reader.value('tDpf') !== null ? reader.value('tDpf') : reader.value('tDpfSens');
         v.engine = typeof st.rpm === 'number' ? running : undefined;
         regen.feed(v);
@@ -128,6 +133,9 @@ mgu.run({
         const bgs = ctx.background || await background(ctx);
         const reader = bgs.reader, regen = bgs.regen;
         let page = 0, detail = 0, detailT = Date.now(), lastDemo = null;
+        // the regeneration request: its sheet (null: closed; { state: 'ask' | 'sending' | 'failed', why })
+        const force = new Force({ signals: ctx.signals, log: ctx.log });
+        let sheet = null;
 
         // ---- demo: Always, or Auto while the link isn't there and nothing has answered
         let demoReader = null, demoRegen = null;
@@ -149,8 +157,13 @@ mgu.run({
         // ---- what to read: the page's values while it is shown
         let visible = ui.isVisible ? ui.isVisible('MAIN') : true;
         const wanted = () => reader.want('ui', visible && !demo() ? PAGE_KEYS[page] : [], PAGE_MS[page]);
-        const turn = (i) => { page = i; detail = 0; detailT = Date.now(); wanted(); return render(); };
+        const turn = (i) => { page = i; detail = 0; detailT = Date.now(); if (sheet && sheet.state !== 'sending') sheet = null; wanted(); return render(); };
         ui.onClick('BTN_PAGE', () => turn((page + 1) % TABS.length));
+        // the bar's button (Standard layout): opens the sheet, and pressed again on it sends the request
+        ui.onClick('BTN_REGEN', () => {
+            if (!sheet) { const why = canForce(data()); sheet = why ? { state: 'failed', why } : { state: 'ask' }; return page !== 0 ? turn(0) : render(); }
+            return askRegen();
+        });
         ui.onClick('BTN_PREV', () => turn((page + TABS.length - 1) % TABS.length));
         // the current tab tapped again: read its page again now (unless the tap closed Settings)
         if (ctx.onTab) ctx.onTab((i, closedSheet) => { if (i !== page) return turn(i); if (!closedSheet) reader.refresh(); return render(); });
@@ -163,8 +176,10 @@ mgu.run({
         // head unit sets its own after start-up, and wall-clock times can jump by hours.
         const mono = () => { const h = process.hrtime(); return h[0] * 1000 + h[1] / 1e6; };
         const trace = { dp: [], tIn: [], nox: [], scr: [] };
-        let traceT = 0;
+        let traceT = 0, traceDemo = null;
         function sample(d) {
+            // the demo's traces are not the car's (and back): a switch starts them again
+            if (d.demo !== traceDemo) { traceDemo = d.demo; Object.keys(trace).forEach((k) => { trace[k].length = 0; }); }
             const now = mono(), since = traceT ? now - traceT : FRESH_MS;
             if (since < 1000) return;
             traceT = now;
@@ -179,7 +194,7 @@ mgu.run({
                 // the demo's tracker is fed here (the background feeds the real one)
                 const s = src(), v = {};
                 ['soot', 'sinceKm', 'loadPct', 'avgStart', 'avgEnd', 'avgKm', 'regens', 'tDpf'].forEach((k) => { v[k] = s.value(k); });
-                v.pid8b = s.raw('pid8b'); v.rgnNum = s.raw('rgnNum'); v.engine = true;
+                v.opMode = s.raw('opMode'); v.pid8b = s.raw('pid8b'); v.rgnNum = s.raw('rgnNum'); v.engine = true;
                 demoRegen.feed(v);
             }
         }
@@ -209,7 +224,7 @@ mgu.run({
                 sinceKm: v('sinceKm'), sinceS: v('sinceS'), sinceL: v('sinceL'), regens: v('regens'), avgKm: v('avgKm'),
                 hist: r.samples.map((p) => [p[0] - r.dist, p[1]]), log: r.log, odo: D.ODO.map((k) => v(k)),
                 adLevel, adLevelEst: v('adLevel') === null && v('adMass') !== null, adRange: v('adRange'), adQual: v('adQual'), noxIn, noxOut, scrT,
-                tScr: v('tScr'), scrEff: v('scrEff'), conv,
+                tScr: v('tScr'), scrEff: v('scrEff'), conv, asked: st.asked, locked: s.raw('rgnLock') === 1, interrupted: s.raw('rgnIntr') === 1,
                 egrHp: { pos: v('egrHp'), target: v('egrHpSet'), why: why('egrHp') }, egrLp: { pos: v('egrLp'), target: v('egrLpSet'), why: why('egrLp') },
                 egrRate: v('egrRate'), air: v('air'), airTarget: v('airSet'), rail: v('rail'), railTarget: v('railSet'), boost, boostTarget: boostT, inj, injCyl,
             };
@@ -417,10 +432,10 @@ mgu.run({
                 blocks = [{ h: 68, draw: (y) => {
                     row(cv, t, x, w, y + 16, 'SOOT BURNT', has(r.progress) ? String(Math.round(r.progress * 100)) : '--', '%');
                     meter(cv, t, x, y + 52, w, 16, r.progress, [t.warn, GO]);
-                } }, { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'RUNNING FOR', !has(r.s) ? '--' : String(r.s < 60 ? Math.max(0, r.s) : Math.floor(r.s / 60)), has(r.s) && r.s < 60 ? 's' : 'min',
+                } }, { h: 48, draw: (y) => row(cv, t, x, w, y + 16, 'RUNNING FOR', !has(r.s) ? '--' : String(r.s < 60 ? Math.max(0, r.s) : Math.floor(r.s / 60)), has(r.s) && r.s < 60 ? 's' : 'minutes',
                     [has(r.km) && num(Dk(r.km), 0) + ' ' + dU(), has(r.soot0) && 'started at ' + r.soot0.toFixed(1) + ' g', r.by === 'heat' && 'seen by its heat'].filter(Boolean).join('  ·  ')) }];
             } else if (st.key === 'due') {
-                head(d.requested ? 'The engine has asked for one' : pct !== null && pct >= 125 ? 'The soot is well past the regeneration point' : 'The soot is at the regeneration point',
+                head(d.requested ? 'The engine has asked for one' : d.asked ? 'Requested from the app' : pct !== null && pct >= 125 ? 'The soot is well past the regeneration point' : 'The soot is at the regeneration point',
                     '20-30 min at a steady ' + (MI() ? '40 mph' : '60 km/h') + ' or more lets it run');
                 blocks = [load, since];
             }
@@ -441,6 +456,47 @@ mgu.run({
             tile(cv, t, LX + 600, ty, tw, th, { label: 'Ash', value: d.ash, unit: 'g', foot: has(d.ash) && has(d.lifeKm) ? { label: 'FILTER LIFE LEFT', text: big(Dk(d.lifeKm)) + ' ' + dU() } : null,
                 sub: has(d.ash) ? 'oil ash, stays in the filter' : d.why('ash') });
             dpfCard(cv, t, d, st, now);
+        }
+
+        /* ---------- the regeneration request: what it does, what it needs, then the one write ---------- */
+
+        const canForce = (d) => force.can({ family: d.family, status: d.status, phase: d.phase, locked: d.locked, demo: d.demo });
+        function askRegen() {
+            if (!sheet || sheet.state === 'sending') return null;
+            const d = data(), why = canForce(d);
+            if (why) { sheet = { state: 'failed', why }; return render(); }
+            sheet = { state: 'sending' };
+            const r = rg();
+            force.request(d.family, d.demo).then((res) => {
+                if (res.ok) { r.asked(); sheet = null; } else sheet = { state: 'failed', why: res.why };
+                return render();
+            }).catch((e) => { sheet = { state: 'failed', why: String(e && e.message || e) }; return render(); });
+            return render();
+        }
+
+        function renderSheet(cv, t, d) {
+            const p = G.panel(cv, t, LX, G.TOP, W - 2 * LX, 468, 'Request regeneration'), x = LX + PAD + 8, bot = p.y + p.h;
+            const sending = sheet.state === 'sending', failed = sheet.state === 'failed';
+            let y = G.TOP + 104;
+            cv.text('The engine unit is told that a regeneration is due, and runs it once the driving allows:', x, y, 26, t.text, { font: 'bold' });
+            y += 58;
+            ['The engine warm: coolant over ' + Math.round(T(75)) + tU(), 'Fuel not on reserve, no exhaust or sensor faults stored',
+                '20-30 min at a steady ' + (MI() ? '40 mph' : '60 km/h') + ' or more; don\'t switch the engine off while it runs'].forEach((line) => {
+                cv.circle(x + 7, y - 9, 5, t.warn);
+                cv.text(line, x + 28, y, 24, t.text);
+                y += 46;
+            });
+            cv.text(failed ? tr('Not sent') + ': ' + tr(sheet.why) : d.demo ? 'Demo: nothing is sent to the car.' : 'One write to the engine unit, as BimmerLink sends it. Not tried on every engine unit.',
+                x, y + 14, 22, failed ? t.crit : t.dim);
+            const by = bot - G.MARGIN - 52;
+            if (!cv.own) {
+                // (the HMI's bar has the buttons)
+                cv.text(sending ? 'Requesting...' : 'Press Request regeneration again to send it, Next page to cancel', x, bot - G.MARGIN, 24, sending ? t.dim : t.text, { font: 'bold' });
+                return;
+            }
+            G.button(cv, t, W - LX - PAD - 300, by, 300, 56, sending ? 'Requesting...' : failed ? 'Send again' : 'Send request', sending ? null : askRegen,
+                { key: 'regenGo', primary: true, busy: sending, color: t.warn });
+            G.button(cv, t, W - LX - PAD - 300 - 24 - 220, by, 220, 56, 'Cancel', sending ? null : () => { sheet = null; return render(); }, { key: 'regenNo', busy: sending });
         }
 
         /* ---------- Regenerations ---------- */
@@ -474,8 +530,8 @@ mgu.run({
                 // nothing seen here yet: the engine unit's own last five (odometer at each, the distances between them)
                 const odo = d.odo.filter(has);
                 if (odo.length) {
-                    G.table(cv, t, x, y0, w, [{ label: 'Regeneration', w: 330 }, { label: 'At', w: 300, align: 'right' }, { label: 'Interval', w: 300, align: 'right' }],
-                        odo.map((km, i) => [i === 0 ? 'Last' : i === 1 ? 'The one before' : (i + 1) + ' back', big(Dk(km)) + ' ' + dU(), i + 1 < odo.length ? big(Dk(km - odo[i + 1])) + ' ' + dU() : '--']),
+                    G.table(cv, t, x, y0, w, [{ label: 'Regeneration', w: 330 }, { label: 'Odometer', w: 300, align: 'right' }, { label: 'Interval', w: 300, align: 'right' }],
+                        odo.map((km, i) => [['Last', 'The one before', 'Third last', 'Fourth last', 'Fifth last'][i], big(Dk(km)) + ' ' + dU(), i + 1 < odo.length ? big(Dk(km - odo[i + 1])) + ' ' + dU() : '--']),
                         { rowH: rh, size: 26, headerSize: hs, middle: true });
                 } else cv.text(d.why('odo1') === 'reading...' ? 'reading...' : 'none on record here: ' + d.why('odo1'), x, top + 38, 26, t.dim);
                 cv.text('Each regeneration from now on is logged with its time, soot and heat,', x, lb - 50, 22, t.dim);
@@ -638,8 +694,10 @@ mgu.run({
             if (!cv.own && Date.now() - detailT > 8000) { detail = (detail + 1) % pages; detailT = Date.now(); }
             detail = Math.min(detail, pages - 1);
             const title = 'Details' + (pages > 1 ? '  ' + (detail + 1) + '/' + pages : ''), p = G.panel(cv, t, LX, G.TOP, W - 2 * LX, 468, title);
-            const id = d.demo ? 'demo' : d.index ? 'engine unit ' + d.index + ' · ' + (d.family === 'other' ? 'not a diesel' : D.NAMES[d.family] || '?') + (d.verified ? '' : ' · unverified') : 'engine unit: not identified yet';
-            const scr = d.scrIndex ? '  ·  AdBlue unit ' + d.scrIndex + (d.scr ? ' (' + d.scr.toUpperCase() + ')' : '') : '';
+            // (drawn literally for the identifiers: its words translated first)
+            const id = d.demo ? tr('DEMO') : d.index ? tr('engine unit') + ' ' + d.index + (d.family ? ' · ' + (d.family === 'other' ? tr('Not a diesel') : D.NAMES[d.family] || d.family)
+                + (d.verified ? '' : ' · ' + tr('Unverified')) : ': ' + tr('not identified yet')) : tr('engine unit') + ': ' + tr('not identified yet');
+            const scr = d.scrIndex ? '  ·  ' + tr('AdBlue unit') + ' ' + d.scrIndex + (d.scr ? ' (' + d.scr.toUpperCase() + ')' : '') : '';
             // (left of the page's buttons where the kit draws them)
             const paged = cv.own && pages > 1, ir = paged ? 1312 : W - LX - PAD, tw = cv.textWidth(title, 26, { font: 'bold' });
             cv.text(fitText(cv, id + scr, 20, ir - (LX + 18 + tw + 24), { literal: true }), ir, p.y + 42, 20, t.dim, { align: 'right', literal: true });
@@ -654,13 +712,13 @@ mgu.run({
                 } else {
                     // why there is none: under the values where it is short, else from the identifier on (over the bytes' room)
                     const long = cv.textWidth(r.why, 22) > 150;
-                    cv.text(fitText(cv, r.why, 22, 360), long ? x + 372 : x + 530, y, 22, t.dim, { align: long ? 'left' : 'right' });
+                    cv.text(fitText(cv, r.why, 22, long && r.bytes ? 166 : 360), long ? x + 372 : x + 530, y, 22, t.dim, { align: long ? 'left' : 'right' });
                 }
                 if (r.bytes) cv.text(fitText(cv, r.bytes, 18, 190, { literal: true }), x + 546, y, 18, t.dim, { literal: true });
             });
             if (pages > 1) {
-                G.button(cv, t, 1336, p.y + 12, 104, 40, 'Prev', () => { detail = (detail + pages - 1) % pages; return render(); }, { key: 'dprev' });
-                G.button(cv, t, 1452, p.y + 12, 104, 40, 'Next', () => { detail = (detail + 1) % pages; return render(); }, { key: 'dnext' });
+                G.button(cv, t, 1336, p.y + 12, 104, 40, '<', () => { detail = (detail + pages - 1) % pages; return render(); }, { key: 'dprev' });
+                G.button(cv, t, 1452, p.y + 12, 104, 40, '>', () => { detail = (detail + 1) % pages; return render(); }, { key: 'dnext' });
             }
         }
 
@@ -673,12 +731,13 @@ mgu.run({
                 const parked = d.status === 'PARKED';
                 message(cv, t, d.status === 'NO LINK' ? 'No diagnostic link' : parked ? 'The car is parked and locked' : 'The engine unit doesn\'t answer',
                     d.status === 'NO LINK' ? 'The head unit\'s diagnostic service isn\'t there yet.' : 'Switch the ignition on or start the engine.', null, parked ? t.text : null);
-            } else [renderDpf, renderRegens, renderAdblue, renderEngine, renderDetails][page](cv, t, d, now);
+            } else if (sheet) renderSheet(cv, t, d);
+            else [renderDpf, renderRegens, renderAdblue, renderEngine, renderDetails][page](cv, t, d, now);
             // the state's badge: an unverified engine unit's LIVE says UNVERIFIED instead (two badges at most: with REGEN, not
             // the whole word, the header still has room for the app's name, so the tabs stay where they are)
             const state = d.demo ? 'DEMO' : d.status === 'LIVE' && d.diesel && !d.verified ? 'UNVERIFIED' : d.status === 'PARKED' ? 'CAR PARKED' : d.status;
             G.frame(cv, t, TABS, page, [
-                d.phase === 'active' && page !== 0 && { text: 'REGEN', color: t.warn },
+                d.phase === 'active' && page !== 0 && { text: 'DPF REGEN', color: t.warn },
                 { text: state, color: state === 'LIVE' ? BLUE : t.warn },
             ]);
             // the demo switched off (the link came up) or on: what to read follows

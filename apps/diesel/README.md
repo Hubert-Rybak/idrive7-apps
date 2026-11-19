@@ -2,8 +2,10 @@
 
 The diesel particulate filter (DPF) and the rest of a B47 / B57's exhaust after-treatment, on the centre screen,
 read from the engine unit (DDE, diagnostic address `0x12`) and the AdBlue unit (SCR, `0x0B`) over the head unit's own
-diagnostic link. **Read-only by construction:** every request goes through `kit/runtime/readonly-diag.js`, which lets
-nothing but `22` (ReadDataByIdentifier) leave the head unit; the app cannot start, stop or reset a regeneration.
+diagnostic link. **Reading goes through `kit/runtime/readonly-diag.js`**, which lets only reading requests (`22`, and
+OBD `01` / `09`) leave the head unit; this app reads with `22` (ReadDataByIdentifier) only. The one exception is
+**Request regeneration** (below): a single write, sent only after the driver confirms it, through its own link
+(`force.js`) that can send nothing else.
 
 > **Status: experimental.** The identifiers and their scalings come from the engine units' SGBDs (the public
 > [EDIABAS reference](https://emdzej.github.io/ediabasx-docs-sgbd/)), each checked field by field against the SGBD's
@@ -14,13 +16,13 @@ nothing but `22` (ReadDataByIdentifier) leave the head unit; the app cannot star
 
 | Tab | Shows |
 |---|---|
-| **DPF** | The soot against the regeneration point (the mark labelled; the bar amber while it burns), the measured soot and the soot model; tiles for the heat before the filter (with the oxidation catalyst's), the pressure drop across it and the ash (with the filter life left), each with its last 2 minutes. A card: **FILTER OK** (the soot load in % of the regeneration point, the distance and driving time since the last one, the next one from the average interval), **REGENERATION DUE** (asked for by the engine, at or well past the point, and what lets it run: 20-30 min at a steady 60 km/h or more) or **REGENERATING** (*Keep driving, don't switch the engine off*, the soot burnt so far, how long and how far it has run); along its bottom the EGR valves OPEN / CLOSED. |
+| **DPF** | The soot against the regeneration point (the mark labelled; the bar amber while it burns), the measured soot and the soot model; tiles for the heat before the filter (with the oxidation catalyst's), the pressure drop across it (these two with their last 2 minutes) and the ash (with the filter life left). A card: **FILTER OK** (the soot load in % of the regeneration point, the distance and driving time since the last one, the next one from the average interval), **REGENERATION DUE** (asked for by the engine, at or well past the point, and what lets it run: 20-30 min at a steady 60 km/h or more) or **REGENERATING** (*Keep driving, don't switch the engine off*, the soot burnt so far, how long and how far it has run); along its bottom the EGR valves OPEN / CLOSED. |
 | **Regenerations** | Each regeneration the app logged, the one running first: start, the distance before it, how long it took, the distance, soot before and after, peak heat, done / stopped early / running. Until the first, the engine unit's own last five (the odometer at each, the distances between them). Totals: the engine unit's count of successful ones, the average distance between them, how many of the logged ones stopped early, and the soot over the last 1,000 km (600 mi) as a sawtooth. |
 | **AdBlue** | **ADBLUE OK** / **REFILL SOON** (2,400 km of range or less) / **REFILL NOW** (1,000 km or less) with the range as the big number and the level (the AdBlue unit's tank); NOx before the SCR catalyst (and after it), the share it removes now (only with the catalyst warm and enough NOx to tell), the catalyst's heat (and before it); the stored average conversion and the AdBlue quality. A car without AdBlue says so. |
 | **Engine** | Each EGR valve, high and low pressure: **OPEN** / **CLOSED** (or NOT FITTED), the gas through it drawn as thick as it is open, the opening and the engine unit's target; the share of exhaust gas in the intake air and the air mass per stroke against its target (the valves close while the filter regenerates). Rail pressure and boost against their targets; the injectors' quantity corrections, each under its cylinder, amber beyond ±1 mg/stroke (meaningful at warm idle). |
 | **Details** | Every value read: its name, identifier, value and the reply's bytes, or why it has none (*reading...*, *not on this car*, *no answer*, *refused now*). |
 
-The state shows in the header too: REGEN on the other pages while one runs, and the link's state (DEMO, LIVE,
+The state shows in the header too: DPF REGEN on the other pages while one runs, and the link's state (DEMO, LIVE,
 UNVERIFIED for an engine unit read with another's layouts, NO ANSWER, CAR PARKED, NOT A DIESEL). In Chinese and
 Korean builds the app's texts are translated (`kit/runtime/locales`).
 
@@ -32,8 +34,10 @@ Settings: km or miles, °C or °F, theme, layout, renderer, demo.
 (`STATUS_REGENERATION_CSF`) uses a dynamically defined identifier (service `2C`), which a read-only app may not use.
 So the app decides by, in this order:
 
-1. **The engine unit's after-treatment status** (DDE 8.3 only, `5372`, the shape of OBD PID 8B: bit 0 = regenerating),
-   together with the heat until it has been seen both at 0 and at 1, then alone (a flag stuck at either is no flag).
+1. **The engine unit's flag**: the operating mode's regeneration bit (`467E` `CoEOM_stOpModeAct`, bit 1, DDE 7 and 8:
+   the bit BimmerLink reads), else the after-treatment status (DDE 8.3 only, `5372`, the shape of OBD PID 8B: bit 0 =
+   regenerating). Together with the heat until it has been seen both at 0 and at 1, then alone (a flag stuck at either
+   is no flag).
 2. **The heat** before the filter (`44EF`, else the sensor value `4502`): 500 °C or more for 30 s, with the soot at
    least half way to the regeneration point, starts one; under 420 °C for 30 s ends it. A regeneration runs at about
    600 °C; one by the heat that burnt no soot (towing, a long climb at full load) isn't logged.
@@ -52,7 +56,28 @@ wasn't running, or it was too short to tell) is logged as done, without its dura
 (DDE 8.3, `5371`: 0 % after a regeneration, 100 % = due), its average soot at a regeneration's start (`4B52`), the
 median of the starts the app has logged, or 24 g (typical for a B47 / B57; shown as *typical*).
 
-**Due:** the load at 100 %, or the engine unit's regeneration request (`44BB`, again only once seen at 0).
+**Due:** the load at 100 %, the engine unit's regeneration request (`44BB` at 4-6, as BimmerLink reads it), or one
+requested from the app that hasn't started yet (it is marked as requested in the log once it runs).
+
+## Request regeneration
+
+The bar's **Request regeneration** button opens a sheet on the DPF page with what a regeneration needs: the engine warm (coolant over 75 °C), fuel not on reserve, no exhaust or sensor faults stored, then
+20-30 min at a steady 60 km/h or more without switching the engine off. **Send request** then sends one write to the
+engine unit (in the Standard layout, where the head unit draws the buttons: the bar's button pressed again), exactly
+as BimmerLink 2.38 sends it (its DPF screen's *Request DPF Regeneration*):
+
+| Engine unit | Request (`2E`, WriteDataByIdentifier, to `0x12`) |
+|---|---|
+| DDE 8.3 (`D83BX7C0` indexes) | `2E 5F B4` + 95 bytes: zeros, `4E 20` at bytes 46-47 |
+| DDE 7 / DDE 9 | `2E 5F B4 04 06 05` + 94 bytes: zeros, `4E 20` at bytes 48-49 |
+
+`5FB4` is the SGBD's *CSF service library* (`ABGLEICH_CSF_PROG`, table `CSF_WERTE`); `4E 20` sets **QFL**, the fuel
+burnt since the last regeneration, to 200.00 l, so the engine unit counts a regeneration as due and runs it once the
+driving allows (the DDE 7 / 9 block's `06 05` names the value: service case 6, EEPROM, value 05, QFL). The answer
+`6E 5F B4` means accepted; a refusal is shown with its reason. Nothing is sent while one runs, while the engine unit
+blocks regenerations (`44C2` = 1), for an engine unit whose family the app doesn't know or without a live engine unit
+(the sheet says why); after an accepted request there is none for 10 minutes. In the demo nothing is sent.
+**Not yet tried on a car by this app**: the bytes are BimmerLink's, the reading of them is the SGBD's.
 
 **In the background** (`app.json` `autostart`): while the engine runs (rpm from the car's signal, not a request) the
 filter's values are read every 20 s, every 5 s during a regeneration; nothing at all once the car is locked and left
@@ -72,7 +97,7 @@ The engine unit tells its SGBD by its SGBD index (`22 F1 50`):
 
 An engine unit whose index isn't here is read like DDE 8.3 (UNVERIFIED) when the car's engine type says diesel or it
 answers soot and the distance since the last regeneration plausibly; one of BMW's petrol engine units (by its index) is
-left alone, and an unknown one only when it refuses both as unknown (NRC 31).
+left alone, and an unknown one only when it refuses both as unknown (NRC 31, 11 or 12).
 
 | Value | DDE 8.3 | DDE 7 | Scaling |
 |---|---|---|---|
@@ -85,7 +110,8 @@ left alone, and an unknown one only when it refuses both as unknown (NRC 31).
 | Successful regenerations, average distance between | `44B8`, `44C7` | same | u16, u16 km |
 | Odometer at the last five successful ones | `44D1`-`44D5` | same | u32 m |
 | Filter life left | `4C78` | same | u16 × 10 km |
-| Regeneration request / lock / interrupted (no value tables) | `44BB` / `44C2` / `44C0` | same | raw |
+| Regeneration request / lock / interrupted (BimmerLink's reading: 4-6 / 1 / 1) | `44BB` / `44C2` / `44C0` | same | raw |
+| Operating mode (bit 1: regeneration) | `467E` | same | u32 |
 | After-treatment status (PID 8B: bit 0 regenerating, bit 1 active) | `5372` | — | u8 |
 | Load against the regeneration point | `5371` | — | (u16 − 32767) × 100 / 255 % |
 | Average soot at a regeneration's start / end | `4B52` / `4B53` | — | u16 × 0.01 − 327.67 g |
@@ -105,18 +131,18 @@ The injector corrections are in firing order (the SGBDs: *"Zylinderspezifische F
 sixth slot has read anything but 0).
 
 **Pacing:** one request at a time, 120 ms apart; each identifier is first read alone, and once its reply length is
-known, it goes with the others of its unit that are due or nearly due, up to 8 in one request. Live values every 1-2 s while their page is shown, the rest every 30 s. A refusal
+known, it goes with the others of its unit that are due or nearly due, up to 8 in one request. Live values every 1-2 s while their page is shown (5 s on Regenerations), the rest every 30 s. A refusal
 (`7F 22 31`) carries no identifier and every app on the head unit gets every reply, so an identifier counts as *not on
 this car* only after three refusals of its own single reads (and is asked again after a while).
 
 ## Not in it
 
-- Starting a regeneration, resetting the filter's adaptation after a replacement, or anything else that writes: the
-  three SGBDs have no routine (`31`) for a forced regeneration, and the app stays read-only.
+- Resetting the filter's adaptation after a replacement, or any other write than the regeneration request.
 - The DPF's fault codes: use the Fault Scanner.
 - A petrol particulate filter (B48 / B58 OPF): Live Data and Service read its soot.
 
 ## Tests
 
 `node kit/tools/test_diesel.js` (Node 8 compatible): the identifier table against BMW's SGBD index, the scalings, the
-reader against a stand-in engine unit, the regeneration tracker, the demo and every page drawn.
+reader against a stand-in engine unit, the regeneration request's bytes and gates, the regeneration tracker, the demo
+and every page drawn.

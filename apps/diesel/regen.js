@@ -4,20 +4,24 @@
  * point, a log of each one and the soot over the last 1,000 km.
  *
  *   const rg = new Regen({ file, log });            // file: data/diesel.json (null = in memory, the demo's)
- *   rg.feed({ soot, sinceKm, tDpf, pid8b, rgnNum, loadPct, avgStart, avgEnd, avgKm, regens, engine }, t)
+ *   rg.feed({ soot, sinceKm, tDpf, opMode, pid8b, rgnNum, loadPct, avgStart, avgEnd, avgKm, regens, engine }, t)
  *                                                   // values just read (null / undefined = not read: the last kept)
- *   rg.state() -> { phase: 'active' | 'due' | 'ok' | 'unknown', by: 'flag' | 'heat' | null, requested, threshold,
+ *   rg.state() -> { phase: 'active' | 'due' | 'ok' | 'unknown', by: 'flag' | 'heat' | null, requested, asked, threshold,
  *                   thresholdBy: 'load' | 'average' | 'learned' | 'typical', load (0..1+), nextKm, run: { t0, s, km, soot0,
  *                   progress, peak, by } | null }
  *   rg.log     -> [{ t0, t1, s, km, interval, soot0, soot1, peak, by, result: 'complete' | 'stopped' }], newest first
  *                 (by 'reset': one only seen by its end, the distance since the last starting again: s, km, soot0 null)
  *   rg.samples -> [[distance km, soot g], ...] over the last HIST_KM
  *   rg.onEvent(fn) -> fn('start' | 'complete' | 'stopped', entry)
+ *   rg.asked()     -> the driver asked the engine unit for one (force.js): the next one within ASK_MS of driving is
+ *                     that one (entry.asked), and until then state().asked
  *
  * Time: durations add up the steps between feeds (at most MAX_STEP_MS each), never wall-clock differences: the head unit
  * sets its clock late and corrects it, by hours, both ways. t (ms, wall clock) only stamps the log.
- * Running: the engine unit's own flag (after-treatment status, OBD PID 8B bit 0: DDE 8 only) together with the heat,
- * and the flag alone once it has been seen both at 0 and at 1 (a flag stuck at either is no flag). Heat: the exhaust
+ * Running: the engine unit's own flag together with the heat, and the flag alone once it has been seen both at 0 and
+ * at 1 (a flag stuck at either is no flag). The flag: the operating mode's regeneration bit (467E bit 1, as BimmerLink
+ * reads it; DDE 7 and 8), else the after-treatment status (OBD PID 8B bit 0: DDE 8 only). Requested: the engine unit's
+ * request 44BB at 4..6 (BimmerLink's reading). Heat: the exhaust
  * before the filter at REGEN_C or more for HOT_MS with the soot at least half way to the regeneration point, until it
  * stays under COOL_C for HOT_MS. A pause shorter than SETTLE_MS (a stop at the lights) resumes the same regeneration.
  * Done: the distance since the last successful regeneration starts again from 0 (BMW's own marker of a successful one);
@@ -30,8 +34,11 @@
 const fs = require('fs');
 
 const REGEN_C = 500, COOL_C = 420, HOT_MS = 30000, SETTLE_MS = 180000, MAX_STEP_MS = 120000;
+const ASK_MS = 3600000;
 const TYPICAL_G = 24, END_G = 2, HIST_KM = 1000, SAMPLE_KM = 2, SAMPLE_G = 0.5, LOG_MAX = 30, SAVE_MS = 60000, BURNT_G = 1;
 const isNum = (x) => typeof x === 'number' && isFinite(x);
+// the regeneration flags, in the order they are trusted: the bit that says regenerating
+const FLAGS = { opMode: (x) => (x >>> 1) & 1, pid8b: (x) => x & 1 };
 const mono = () => { const h = process.hrtime(); return h[0] * 1000 + h[1] / 1e6; };
 
 function writeWhole(file, text) {
@@ -56,8 +63,9 @@ class Regen {
         this.log = [];                 // newest first
         this.run = null;               // the regeneration running: { t0, ms, d0, since0, soot0, soot, peak, by }
         this.ending = null;            // ended, not yet told done or stopped: { entry, run, ran (ms of engine running since) }
-        this.seen0 = { pid8b: false, rgnNum: false };
-        this.seen1 = { pid8b: false };
+        this.seen0 = { opMode: false, pid8b: false, rgnNum: false };
+        this.seen1 = { opMode: false, pid8b: false };
+        this.askMs = 0;                // driving time left in which a regeneration is the one the driver asked for
         this.hotMs = 0; this.coolMs = 0; this.hot = false; this.latch = false;
         this.thrLoad = null;           // the regeneration point from the load % (smoothed)
         this.last = {};                // the last value of each key fed
@@ -78,8 +86,9 @@ class Regen {
         this.log = Array.isArray(s.log) ? s.log.filter((e) => e && isNum(e.t0)).slice(0, LOG_MAX) : [];
         this.run = s.run && isNum(s.run.t0) ? Object.assign({ ms: 0 }, s.run) : null;
         this.ending = s.ending && s.ending.entry && s.ending.run ? Object.assign({ ran: 0 }, s.ending) : null;
-        this.seen0 = Object.assign({ pid8b: false, rgnNum: false }, s.seen0);
-        this.seen1 = Object.assign({ pid8b: false }, s.seen1);
+        this.seen0 = Object.assign({ opMode: false, pid8b: false, rgnNum: false }, s.seen0);
+        this.seen1 = Object.assign({ opMode: false, pid8b: false }, s.seen1);
+        this.askMs = isNum(s.askMs) ? s.askMs : 0;
         this.latch = s.latch === true;
         this.thrLoad = isNum(s.thrLoad) ? s.thrLoad : null;
         // a regeneration by the heat goes on as one: the heat needs no 30 s to come back
@@ -92,7 +101,7 @@ class Regen {
         this.savedT = now; this.dirty = false;
         try {
             writeWhole(this.file, JSON.stringify({ v: 1, dist: Math.round(this.dist * 1000) / 1000, lastSince: this.lastSince, samples: this.samples,
-                log: this.log, run: this.run, ending: this.ending, seen0: this.seen0, seen1: this.seen1, latch: this.latch, thrLoad: this.thrLoad }));
+                log: this.log, run: this.run, ending: this.ending, seen0: this.seen0, seen1: this.seen1, latch: this.latch, thrLoad: this.thrLoad, askMs: this.askMs }));
         } catch (e) { this.log0.warn('diesel log: ' + e); }
     }
 
@@ -131,11 +140,14 @@ class Regen {
             const thr = v.soot * 100 / v.loadPct;
             if (thr >= 5 && thr <= 80) { this.thrLoad = this.thrLoad === null ? thr : this.thrLoad * 0.8 + thr * 0.2; this.dirty = true; }
         }
-        // ---- flags: seen at 0 (a request / regeneration flag that ever reads 0) and, for PID 8B, at 1
-        if (isNum(v.pid8b)) {
-            if ((v.pid8b & 1) === 0 && !this.seen0.pid8b) { this.seen0.pid8b = true; this.dirty = true; }
-            if ((v.pid8b & 1) === 1 && this.seen0.pid8b && !this.seen1.pid8b) { this.seen1.pid8b = true; this.dirty = true; }
-        }
+        // ---- flags: seen at 0 (a request / regeneration flag that ever reads 0) and, for the regeneration flags, at 1
+        Object.keys(FLAGS).forEach((k) => {
+            if (!isNum(v[k])) return;
+            const b = FLAGS[k](v[k]);
+            if (b === 0 && !this.seen0[k]) { this.seen0[k] = true; this.dirty = true; }
+            if (b === 1 && this.seen0[k] && !this.seen1[k]) { this.seen1[k] = true; this.dirty = true; }
+        });
+        if (this.askMs > 0) { this.askMs = Math.max(0, this.askMs - dt); this.dirty = true; }
         if (isNum(v.rgnNum) && v.rgnNum === 0 && !this.seen0.rgnNum) { this.seen0.rgnNum = true; this.dirty = true; }
         // ---- heat before the filter (only with the engine running)
         const temp = isNum(v.tDpf) ? v.tDpf : null;
@@ -146,10 +158,11 @@ class Regen {
             else { if (!this.hot) this.hotMs = 0; this.coolMs = 0; }       // in between: keeps what it was
         }
         // ---- running?
-        const flagKnown = isNum(L.pid8b) && this.seen0.pid8b, bit = flagKnown && (L.pid8b & 1) === 1;
+        const fk = isNum(L.opMode) && this.seen0.opMode ? 'opMode' : 'pid8b';
+        const flagKnown = isNum(L[fk]) && this.seen0[fk], bit = flagKnown && FLAGS[fk](L[fk]) === 1;
         let on;
         if (!engineOn) on = false;
-        else if (this.seen0.pid8b && this.seen1.pid8b) on = isNum(v.pid8b) ? bit : this.run ? true : bit;   // the flag decides (not read now: as it was)
+        else if (this.seen0[fk] && this.seen1[fk]) on = isNum(v[fk]) ? bit : this.run ? true : bit;   // the flag decides (not read now: as it was)
         else on = bit || this.hot;
         const by = bit ? 'flag' : 'heat';
         // (after a regeneration was done, a new one only once it has read as not running: the heat lingers)
@@ -178,7 +191,9 @@ class Regen {
             this.log0.info('regeneration goes on');
             return;
         }
-        this.run = { t0: t, ms: 0, d0: this.dist, since0: isNum(L.sinceKm) ? L.sinceKm : null, soot0: isNum(L.soot) ? L.soot : null, soot: L.soot, peak: null, by };
+        this.run = { t0: t, ms: 0, d0: this.dist, since0: isNum(L.sinceKm) ? L.sinceKm : null, soot0: isNum(L.soot) ? L.soot : null, soot: L.soot, peak: null, by,
+            asked: this.askMs > 0 };
+        this.askMs = 0;
         this.dirty = true;
         this.log0.info('regeneration started (' + by + '), soot ' + (isNum(L.soot) ? L.soot.toFixed(1) + ' g' : '?') + ', ' + (isNum(L.sinceKm) ? L.sinceKm.toFixed(0) + ' km' : '?') + ' since the last');
         this.emit('start', this.run);
@@ -188,7 +203,7 @@ class Regen {
         const r = this.run, L = this.last;
         this.run = null;
         const entry = { t0: r.t0, t1: t, s: Math.round(r.ms / 1000), km: Math.round((this.dist - r.d0) * 10) / 10, interval: r.since0,
-            soot0: r.soot0, soot1: isNum(L.soot) ? L.soot : null, peak: r.peak, by: r.by, result: null };
+            soot0: r.soot0, soot1: isNum(L.soot) ? L.soot : null, peak: r.peak, by: r.by, asked: r.asked === true, result: null };
         this.ending = { entry, run: r, ran: 0 };
         this.dirty = true;
     }
@@ -223,6 +238,14 @@ class Regen {
         this.save(true);
     }
 
+    /** The driver asked the engine unit for a regeneration (force.js accepted): the next one is that one. */
+    asked() {
+        this.askMs = ASK_MS;
+        this.dirty = true;
+        this.log0.info('regeneration asked for by the driver');
+        this.save(true);
+    }
+
     /** The regeneration point (g) and where it came from. */
     threshold() {
         if (isNum(this.thrLoad)) return { g: this.thrLoad, by: 'load' };
@@ -236,7 +259,7 @@ class Regen {
     state() {
         const L = this.last, thr = this.threshold();
         const load = isNum(L.loadPct) ? L.loadPct / 100 : isNum(L.soot) ? L.soot / thr.g : null;
-        const requested = this.seen0.rgnNum && isNum(L.rgnNum) && L.rgnNum > 0;
+        const requested = isNum(L.rgnNum) && L.rgnNum >= 4 && L.rgnNum <= 6;
         const nextKm = isNum(L.avgKm) && isNum(L.sinceKm) ? Math.max(0, L.avgKm - L.sinceKm) : null;
         let phase = 'unknown', run = null;
         if (this.run) {
@@ -244,11 +267,11 @@ class Regen {
             const r = this.run, end = isNum(L.avgEnd) && L.avgEnd >= 0 && L.avgEnd < 15 ? L.avgEnd : END_G;
             const progress = isNum(r.soot0) && isNum(L.soot) ? Math.max(0, Math.min(1, (r.soot0 - L.soot) / Math.max(1, r.soot0 - end))) : null;
             run = { t0: r.t0, s: Math.round(r.ms / 1000), km: Math.round((this.dist - r.d0) * 10) / 10, soot0: r.soot0, progress, peak: r.peak, by: r.by };
-        } else if (load !== null) phase = load >= 1 || requested ? 'due' : 'ok';
-        return { phase, by: this.run ? this.run.by : null, requested, threshold: thr.g, thresholdBy: thr.by, load, nextKm, run };
+        } else if (load !== null || requested || this.askMs > 0) phase = (load !== null && load >= 1) || requested || this.askMs > 0 ? 'due' : 'ok';
+        return { phase, by: this.run ? this.run.by : null, requested, asked: this.askMs > 0, threshold: thr.g, thresholdBy: thr.by, load, nextKm, run };
     }
 }
 
 Regen.REGEN_C = REGEN_C; Regen.COOL_C = COOL_C; Regen.HOT_MS = HOT_MS; Regen.SETTLE_MS = SETTLE_MS; Regen.TYPICAL_G = TYPICAL_G;
-Regen.HIST_KM = HIST_KM; Regen.MAX_STEP_MS = MAX_STEP_MS;
+Regen.HIST_KM = HIST_KM; Regen.MAX_STEP_MS = MAX_STEP_MS; Regen.ASK_MS = ASK_MS;
 module.exports = { Regen };

@@ -274,7 +274,7 @@ class Reader {
         this.once('ok' + r.ecu + r.did, 'unit ' + hex(r.ecu) + ' ' + r.did + ': ' + r.bytes);
         e.keys.forEach((key) => {
             const spec = this.specOf(key), v = D.decode(spec, data);
-            this.vals[key] = { v, raw: D.rawOf(spec, data), at: now, why: v === null ? (data.length < (spec.at || 0) + (spec.bytes || 1) ? 'reply too short' : 'out of range') : '' };
+            this.vals[key] = { v, raw: D.rawOf(spec, data), at: now, why: v === null ? (data.length < (spec.at || 0) + (spec.bytes || 1) ? 'reply too short' : 'value out of range') : '' };
         });
     }
 

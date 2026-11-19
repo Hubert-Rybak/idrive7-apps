@@ -2424,12 +2424,47 @@ SOOT, BANK 1	그을음, 뱅크 1
 SOOT, BANK 2	그을음, 뱅크 2
 Bank 1	뱅크 1
 # Diesel
+Press Request regeneration again to send it, Next page to cancel	재생 요청을 한 번 더 누르면 전송, 다음 화면을 누르면 취소
+No engine start once the range is used up	주행거리를 다 쓰면 엔진 시동이 걸리지 않습니다
+estimated, from the engine unit's figure	추정값, 엔진 제어기 수치 기준
+DPF REGEN	DPF 재생
+The one before	그 이전
+Third last	세 번째 전
+Fourth last	네 번째 전
+Fifth last	다섯 번째 전
+minutes	분
+link busy	진단 연결 사용 중
+reply too short	응답이 너무 짧음
+value out of range	값 범위 초과
+AdBlue unit	AdBlue 제어기
+mg/stroke	mg/행정
+Operating mode	운전 모드
+Request regeneration	재생 요청
+Requested from the app	앱에서 요청함
+The engine unit is told that a regeneration is due, and runs it once the driving allows:	엔진 제어기에 재생이 필요하다고 알리며, 주행 조건이 맞으면 재생을 실행합니다:
+The engine warm: coolant over 75°C	엔진 예열: 냉각수 75°C 이상
+The engine warm: coolant over 167°F	엔진 예열: 냉각수 167°F 이상
+Fuel not on reserve, no exhaust or sensor faults stored	연료가 예비 상태가 아니고, 배기 또는 센서 고장이 저장되어 있지 않음
+20-30 min at a steady 60 km/h or more; don't switch the engine off while it runs	60 km/h 이상으로 20-30분 꾸준히 주행; 재생 중에는 엔진을 끄지 마세요
+20-30 min at a steady 40 mph or more; don't switch the engine off while it runs	40 mph 이상으로 20-30분 꾸준히 주행; 재생 중에는 엔진을 끄지 마세요
+Demo: nothing is sent to the car.	데모: 차량에 아무것도 전송하지 않습니다.
+One write to the engine unit, as BimmerLink sends it. Not tried on every engine unit.	BimmerLink와 같은 방식으로 엔진 제어기에 한 번 기록합니다. 모든 엔진 제어기에서 시험된 것은 아닙니다.
+Not sent	전송 안 됨
+Send request	요청 보내기
+Requesting...	요청 중...
+Send again	다시 보내기
+Cancel	취소
+not for this engine unit	이 엔진 제어기에는 해당 없음
+the engine unit isn't answering	엔진 제어기가 응답하지 않음
+blocked by the engine unit	엔진 제어기가 차단함
+already requested	이미 요청함
+unexpected answer	예상하지 못한 응답
 ADBLUE OK	AdBlue 정상
 REFILL SOON	곧 보충 필요
 REFILL NOW	지금 보충
 AdBlue quality	AdBlue 품질
 Air mass	흡입 공기량
-Ash	애시
+Ash	재
 Average interval	평균 간격
 past the average interval of	평균 간격 초과
 Before the filter	필터 전단
@@ -2527,7 +2562,7 @@ AdBlue unit not known	AdBlue 제어기 미확인
 none on record here	기록 없음
 not on this car	이 차량에 없음
 of the regeneration point	재생 기준 대비
-oil ash, stays in the filter	오일 애시, 필터에 남음
+oil ash, stays in the filter	오일 재, 필터에 남음
 refused now (conditions)	현재 거부됨 (조건)
 regeneration at about	재생 기준 약
 regeneration at	재생 기준

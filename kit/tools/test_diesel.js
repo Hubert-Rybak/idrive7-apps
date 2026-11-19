@@ -7,7 +7,8 @@
  *     until its length is known and then several, a refusal counted as "not on this car" only after its own single
  *     reads, nothing read while the car is locked and left, a petrol engine unit left alone, DDE 7's EGR identifiers,
  *     the AdBlue unit's tank;
- *   - regen.js: a regeneration by the engine unit's flag and by the heat, done (the distance since the last one back to
+ *   - force.js: the regeneration request's two blocks as BimmerLink sends them, when it may be sent, the answer;
+ *   - regen.js: a regeneration by the engine unit's flags (467E, PID 8B) and by the heat, done (the distance since the last one back to
  *     0) or stopped, a stuck flag ignored, the regeneration point from the load % / the average / the log / typical,
  *     due and requested, the soot history and the app's distance, saved and loaded again;
  *   - demo.js: its seeded log and every value the pages draw;
@@ -99,6 +100,47 @@ const DDE83 = () => ({
 
 const cases = [];
 const test = (name, fn) => cases.push([name, fn]);
+
+/* ---------- force.js ---------- */
+test('force: BimmerLink\'s two blocks byte for byte; none for an engine unit it doesn\'t know', () => {
+    const { Force } = require(path.join(APP, 'force'));
+    const z = (n) => new Array(n + 1).join('00');
+    // as in BimmerLink 2.38.1 (models/b$c: the 2E request to 0x12), DDE 8.3 (its SGBD indexes) and every other DDE
+    const A = '2e5f' + 'b4' + z(15) + z(16) + z(12) + '4e200000' + z(16) + z(16) + z(16);
+    const B = '2e5f' + 'b4040605' + z(12) + z(16) + z(14) + '4e20' + z(16) + z(16) + z(16) + '0000';
+    const req = (f) => [0x2E].concat(Force.block(f)).map((b) => (b < 16 ? '0' : '') + b.toString(16)).join('');
+    assert.strictEqual(req('d83'), A); assert.strictEqual(req('d83').length / 2, 98);
+    assert.strictEqual(req('d7x'), B); assert.strictEqual(req('d94'), B); assert.strictEqual(B.length / 2, 100);
+    assert.strictEqual(Force.block('unknown'), null); assert.strictEqual(Force.block('other'), null); assert.strictEqual(Force.block(null), null);
+});
+
+test('force: sent only when it may be, once; the engine unit\'s answer told', async () => {
+    const real = require(path.join(KIT, 'diag')), sent = [];
+    let answer = [0x6E, 0x5F, 0xB4];
+    class FakeDiag { init() { return Promise.resolve(this); } physical(target, sid, data, ms, accept) {
+        sent.push([target, sid].concat(data)); const u = answer; return Promise.resolve(accept(u) ? u : null); } }
+    stubs['./kit/diag'] = Object.assign({}, real, { Diag: FakeDiag });
+    delete require.cache[require.resolve(path.join(APP, 'force'))];
+    try {
+        const { Force } = require(path.join(APP, 'force'));
+        const f = new Force({ signals: {}, log: quiet() }), ok = { family: 'd83', status: 'LIVE', phase: 'ok', locked: false, demo: false };
+        assert.strictEqual(f.can(ok), null);
+        assert.strictEqual(f.can(Object.assign({}, ok, { family: 'unknown' })), 'not for this engine unit');
+        assert.strictEqual(f.can(Object.assign({}, ok, { status: 'NO ANSWER' })), 'the engine unit isn\'t answering');
+        assert.strictEqual(f.can(Object.assign({}, ok, { phase: 'active' })), 'regenerating');
+        assert.strictEqual(f.can(Object.assign({}, ok, { locked: true })), 'blocked by the engine unit');
+        assert.deepStrictEqual(await f.request('d83', true), { ok: true, demo: true }); assert.strictEqual(sent.length, 0, 'the demo sends nothing');
+        const g = new Force({ signals: {}, log: quiet() });
+        answer = [0x7F, 0x2E, 0x22];
+        assert.deepStrictEqual(await g.request('d7x'), { ok: false, why: 'conditions not correct' });
+        assert.strictEqual(g.can(ok), null, 'a refused one may be tried again');
+        answer = [0x6E, 0x5F, 0xB4];
+        assert.deepStrictEqual(await g.request('d7x'), { ok: true });
+        assert.strictEqual(sent.length, 2); assert.strictEqual(sent[1][0], 0x12); assert.strictEqual(sent[1][1], 0x2E); assert.strictEqual(sent[1].length, 1 + 100);
+        assert.strictEqual(g.can(ok), 'already requested', 'then none for a while');
+        assert.deepStrictEqual(await g.request('unknown'), { ok: false, why: 'not for this engine unit' }); assert.strictEqual(sent.length, 2);
+    } finally { delete stubs['./kit/diag']; delete require.cache[require.resolve(path.join(APP, 'force'))]; }
+});
 
 /* ---------- dde.js ---------- */
 test('dde: every B47 / B57 engine unit in BMW\'s index has its layout family', () => {
@@ -358,10 +400,29 @@ test('regen: the regeneration point from the load %, the average start, the log,
     const r2 = new Regen({});
     r2.log = [{ t0: 1, result: 'complete', soot0: 22 }, { t0: 2, result: 'complete', soot0: 26 }, { t0: 3, result: 'stopped', soot0: 40 }, { t0: 4, result: 'complete', soot0: 23 }];
     assert.deepStrictEqual(r2.threshold(), { g: 23, by: 'learned' });
-    r2.feed({ soot: 10, rgnNum: 2 }, T0); assert.strictEqual(r2.state().requested, false, 'a request flag counts once seen at 0');
-    r2.feed({ rgnNum: 0 }, T0 + S); r2.feed({ rgnNum: 1 }, T0 + 2 * S);
+    r2.feed({ soot: 10, rgnNum: 2 }, T0); assert.strictEqual(r2.state().requested, false, 'requested: 44BB at 4..6 (BimmerLink)');
+    r2.feed({ rgnNum: 5 }, T0 + S);
     assert.strictEqual(r2.state().requested, true); assert.strictEqual(r2.state().phase, 'due');
+    r2.feed({ rgnNum: 0 }, T0 + 2 * S); assert.strictEqual(r2.state().phase, 'ok');
+    // asked for by the driver (force.js): due, and the next one within ASK_MS of driving is that one
+    r2.asked(); assert.strictEqual(r2.state().asked, true); assert.strictEqual(r2.state().phase, 'due');
     r2.feed({ avgKm: 441, sinceKm: 300 }, T0 + 3 * S); near(r2.state().nextKm, 141, 1e-9);
+});
+
+test('regen: the operating mode\'s regeneration bit (467E bit 1) runs one, before PID 8B; one asked for is marked', () => {
+    const rg = new Regen({}), ev = events(rg);
+    rg.asked();
+    drive(rg, [[10 * S, { soot: 20, sinceKm: 300, opMode: 1, pid8b: 0, tDpf: 300, engine: true }], [5 * MIN, { opMode: 3, soot: 15, tDpf: 300 }]]);
+    assert.strictEqual(rg.state().phase, 'active', 'the bit alone, with no heat'); assert.strictEqual(rg.state().by, 'flag');
+    assert.strictEqual(rg.state().asked, false, 'the asked one has started');
+    drive(rg, [[5 * S, { opMode: 1, soot: 4, tDpf: 300 }]]);
+    assert.notStrictEqual(rg.state().phase, 'active', 'the bit seen at 0 and 1: it alone ends it');
+    drive(rg, [[5 * S, { sinceKm: 0.1, soot: 3 }]]);
+    assert.deepStrictEqual(ev, ['start', 'complete']); assert.strictEqual(rg.log[0].asked, true);
+    // the time to start it runs out with the driving
+    const r2 = new Regen({});
+    r2.asked(); drive(r2, [[Regen.ASK_MS + MIN, { soot: 10, sinceKm: 100, opMode: 1, engine: true }]], 60 * S);
+    assert.strictEqual(r2.state().asked, false);
 });
 
 test('regen: the app\'s distance through resets, the soot history, saved and loaded', () => {

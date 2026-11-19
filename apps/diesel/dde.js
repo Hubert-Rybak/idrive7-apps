@@ -1,7 +1,7 @@
 'use strict';
 /**
  * dde.js - what the Diesel app reads, and where: a B47 / B57 diesel's engine unit (DDE, address 0x12) and the AdBlue
- * unit (SCR, 0x0B), with UDS ReadDataByIdentifier (22) only.
+ * unit (SCR, 0x0B), with UDS ReadDataByIdentifier (22) only (the regeneration request's one write: force.js).
  *
  * The identifiers and their layouts are from the units' SGBDs (the public EDIABAS reference,
  * https://emdzej.github.io/ediabasx-docs-sgbd/): D83BX7C0 (DDE 8.3x, the G-series B47 / B57), D75BX7A0 and D70BX7A0
@@ -73,9 +73,11 @@ const VALUES = {
     odo4: Object.assign({ unit: 'km' }, same(u32('44D4', 0.001, 0, 1, 3000000))),
     odo5: Object.assign({ unit: 'km' }, same(u32('44D5', 0.001, 0, 1, 3000000))),
     lifeKm: Object.assign({ unit: 'km' }, same(u16('4C78', 10, 0, 0, 600000))),                         // the filter's remaining distance (service; FF FF: none)
-    rgnNum: Object.assign({ unit: '', live: true }, same(u8('44BB', 0, 255))),                          // PFltRgn_numRgn: regeneration requested / running (no table)
-    rgnLock: Object.assign({ unit: '' }, same(u8('44C2', 0, 255))),                                     // PFltRgn_stLck: blocked (no table)
-    rgnIntr: Object.assign({ unit: '' }, same(u16('44C0', 1, 0, 0, 65535))),                            // PFltRgn_stIntr: interrupted (no table)
+    rgnNum: Object.assign({ unit: '', live: true }, same(u8('44BB', 0, 255))),                          // PFltRgn_numRgn: 4..6 = regeneration requested (BimmerLink)
+    rgnLock: Object.assign({ unit: '', live: true }, same(u8('44C2', 0, 255))),                         // PFltRgn_stLck: 1 = blocked (BimmerLink)
+    rgnIntr: Object.assign({ unit: '' }, same(u16('44C0', 1, 0, 0, 65535))),                            // PFltRgn_stIntr: 1 = interrupted (BimmerLink)
+    // CoEOM_stOpModeAct: the engine's operating mode, a bit each; bit 1 (2) = regeneration mode, as BimmerLink reads it
+    opMode: Object.assign({ unit: '', live: true }, same(u32('467E', 1, 0, 0, 4294967295))),
     // DDE 8 only: the after-treatment status as OBD PID 8B has it (bit 0 = regenerating, bit 1 = active), the soot load
     // against the regeneration point (0 % after one, 100 % = due), and the averages at a regeneration's start / end
     pid8b: { unit: '', live: true, d83: u8('5372', 0, 255) },
