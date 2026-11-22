@@ -9,7 +9,7 @@
 
 - Redline, Service, M Vitals, eDrive, Live Data, G-Force, Warm-Up, Virtual Dyno,
   Brake Test, Drag Timer, Fault Scanner, Engine Config, Transmission Config,
-  Doom의 공통 설정 및 앱 표시 문구 번역.
+  Diesel, Doom의 공통 설정 및 앱 표시 문구 번역.
 - `kit/runtime/locales/ko.tsv`와 `ko.json`: 한국어 사전 1,774개 항목.
 - Noto Sans CJK KR 기반 한글 글꼴. 번역에 쓰인 모든 글자, KS X 1001의 완성형
   한글 2,350자, 호환 자모, 숫자·단위·기호를 하나의 공용 아틀라스에 포함.
@@ -186,7 +186,7 @@ python kit/tools/test_ko.py
 
 검증일: 2026-11-04
 
-- 한국어 검사: 15개 앱의 메뉴·리소스 한도, 번역 1,774개와 글꼴 포함 범위,
+- 한국어 검사: 16개 앱의 메뉴·리소스 한도, 번역 1,774개와 글꼴 포함 범위,
   Service 한국어 날짜·정비 명칭·힌트·깨진 값 대체, 단위·단복수 처리 검사.
 - M Vitals와 Redline의 `Rev scale up to`를 `회전수 눈금 최댓값`으로 번역.
   설정 키 `rpmScale`, 숫자 선택값과 기본값은 원본 그대로 유지.
